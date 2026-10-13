@@ -59,9 +59,8 @@
     "undici": "^8.10.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.86.0",
-    "@earendil-works/pi-coding-agent": "^0.86.0",
-    "@earendil-works/pi-server": "^0.86.0",
+    "@earendil-works/pi-ai": "1.2.0",
+    "@earendil-works/pi-coding-agent": "1.2.0",
     "@types/node": "^22.20.1",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3"
