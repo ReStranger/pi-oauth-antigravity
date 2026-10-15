@@ -18,6 +18,7 @@ import {
 import { getCurrentSystemPrompt, getCurrentTools } from "./transcript.js";
 import {
   antigravityHeaders,
+  DEFAULT_ENDPOINT,
   endpointCandidates,
   fetchAvailableRuntimeModel,
   formatRequestDiagnostics,
@@ -1142,8 +1143,13 @@ export function streamAntigravity(
               break;
             }
             if (response.ok) break;
-            // 429s were already retried above; every endpoint shares the same throttle.
-            if (response.status === 429) break;
+            // 429s were already retried above and endpoints usually share one throttle,
+            // but a sticky non-default endpoint may not serve this model: try the rest once.
+            if (
+              response.status === 429 &&
+              (endpoint === DEFAULT_ENDPOINT || isPlanQuotaError(response.status, lastText))
+            )
+              break;
             if (![403, 404, 500, 502, 503, 504].includes(response.status)) break;
           }
 

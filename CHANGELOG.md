@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-10-15
+
+### Fixed
+- Default Antigravity client version raised from 2.8.0 to 2.23.0, since Cloud Code rejects newer models such as Gemini 4 Argon (reported as 429 "Resource has been exhausted") for older clients. Override with `ANTIGRAVITY_HUB_VERSION`.
+- A transient 429 on a non-default endpoint now falls through to the remaining endpoints instead of failing immediately; plan-quota 429s still fail fast.
+
 ## [0.1.7] - 2026-10-15
 
 ### Added

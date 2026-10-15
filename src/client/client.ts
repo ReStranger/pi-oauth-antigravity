@@ -64,7 +64,8 @@ export function endpointCandidates(preferredEndpoint?: string): string[] {
   return ENDPOINT_FALLBACKS;
 }
 
-const DEFAULT_ANTIGRAVITY_VERSION = "2.8.0";
+// Cloud Code rejects newer models (e.g. Gemini 4 Argon) for clients below 2.23.0.
+const DEFAULT_ANTIGRAVITY_VERSION = "2.23.0";
 const DEFAULT_ANTIGRAVITY_CL = "963137146";
 
 function defaultUserAgent(): string {
