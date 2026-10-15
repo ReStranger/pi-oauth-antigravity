@@ -22,14 +22,25 @@ Google Antigravity OAuth provider extension for [Pi](https://pi.dev). Connects P
 
 | Public Model ID | Backend Wire ID | Max Output | Context Window |
 | :--- | :--- | :--- | :--- |
+| `antigravity/gemini-4-argon` | `gemini-4-argon-{low,medium,high}`† | 65,536† | 1,048,576† |
 | `antigravity/gemini-3.8-flash` | `gemini-3.8-flash-{low,medium,high}` | 65,536 | 1,048,576 |
 | `antigravity/gemini-3.7-flash` | `gemini-3.7-flash-{low,medium,high}` | 65,536 | 1,048,576 |
 | `antigravity/gemini-3.7-flash-thinking` | `gemini-3.7-flash-thinking` | 65,536 | 1,048,576 |
 | `antigravity/gemini-3.6-flash` | `gemini-3.6-flash-{low,medium,high}` | 65,536 | 1,048,576 |
 | `antigravity/gemini-3.1-pro` | `gemini-3.1-pro` | 65,536 | 1,048,576 |
-| `antigravity/claude-sonnet-4-6` | `claude-sonnet-4-6` | 64,000 | 200,000 |
 | `antigravity/claude-opus-4-6` | `claude-opus-4-6` | 64,000 | 200,000 |
+| `antigravity/claude-opus-5-5-low` | `claude-opus-5-5-low` | 64,000* | 250,000* |
+| `antigravity/claude-opus-5-5-medium` | `claude-opus-5-5-medium` | 64,000* | 250,000* |
+| `antigravity/claude-opus-5-5-high` | `claude-opus-5-5-high` | 64,000* | 250,000* |
+| `antigravity/claude-sonnet-4-6` | `claude-sonnet-4-6` | 64,000 | 200,000 |
+| `antigravity/claude-sonnet-5-5-low` | `claude-sonnet-5-5-low` | 64,000* | 200,000* |
+| `antigravity/claude-sonnet-5-5-medium` | `claude-sonnet-5-5-medium` | 64,000* | 200,000* |
+| `antigravity/claude-sonnet-5-5-high` | `claude-sonnet-5-5-high` | 64,000* | 200,000* |
 | `antigravity/gpt-oss-120b` | `gpt-oss-120b` | 8,192 | 131,072 |
+
+† Inferred from runtime ids referenced by Antigravity IDE 2.23.0, not yet confirmed against a live model listing; limits and pricing are provisional, and requests fall back to Gemini 3.8 Flash if the backend rejects the model.
+
+\* Provisional same-family estimates only; Claude 5.5 backend output/context limits have not been verified.
 
 ## Installation
 

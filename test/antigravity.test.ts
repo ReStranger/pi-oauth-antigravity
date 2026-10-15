@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	ANTIGRAVITY_MODELS,
+	ANTIGRAVITY_ROUTING,
 	PROVIDER_ID,
 	getAntigravityRequestModelId,
 	getFallbackRuntimeModel,
@@ -266,21 +267,51 @@ test("transcript adapter replays normalized system deltas", () => {
 
 /* ------------------------------- models.ts ------------------------------- */
 
-test("model catalog mirrors agy models with per-model thinking maps", () => {
+test("model catalog registers all Claude 5.5 tiers with per-model thinking maps", () => {
 	assert.equal(PROVIDER_ID, "antigravity");
-	assert.equal(ANTIGRAVITY_MODELS.length, 7);
+	assert.equal(ANTIGRAVITY_MODELS.length, 14);
 	const ids = ANTIGRAVITY_MODELS.map((m) => m.id).sort();
 	assert.deepEqual(ids, [
 		"claude-opus-4-6",
+		"claude-opus-5-5-high",
+		"claude-opus-5-5-low",
+		"claude-opus-5-5-medium",
 		"claude-sonnet-4-6",
+		"claude-sonnet-5-5-high",
+		"claude-sonnet-5-5-low",
+		"claude-sonnet-5-5-medium",
 		"gemini-3.1-pro",
 		"gemini-3.6-flash",
 		"gemini-3.7-flash",
 		"gemini-3.8-flash",
+		"gemini-4-argon",
 		"gpt-oss-120b",
 	]);
 	for (const model of ANTIGRAVITY_MODELS) {
 		assert.ok((model as { thinkingLevelMap?: Record<string, unknown> }).thinkingLevelMap);
+	}
+	const opusMedium = ANTIGRAVITY_MODELS.find((model) => model.id === "claude-opus-5-5-medium");
+	assert.ok(opusMedium);
+	assert.equal(opusMedium.reasoning, true);
+	const thinkingLevels = opusMedium.thinkingLevelMap as unknown as Record<string, string | null>;
+	assert.equal(thinkingLevels.medium, "medium");
+	assert.equal(thinkingLevels.low, null);
+	assert.equal(thinkingLevels.high, null);
+
+	for (const [family, tier] of [
+		["opus", "low"],
+		["opus", "medium"],
+		["opus", "high"],
+		["sonnet", "low"],
+		["sonnet", "medium"],
+		["sonnet", "high"],
+	] as const) {
+		const model = ANTIGRAVITY_MODELS.find((item) => item.id === `claude-${family}-5-5-${tier}`);
+		assert.ok(model, `missing claude-${family}-5-5-${tier}`);
+		assert.equal(model.reasoning, true);
+		assert.deepEqual(model.input, ["text", "image"]);
+		const levels = model.thinkingLevelMap as unknown as Record<string, string | null>;
+		assert.equal(levels[tier], tier);
 	}
 });
 
@@ -293,14 +324,61 @@ test("effort routing maps public ids to backend runtime ids", () => {
 	assert.equal(getAntigravityRequestModelId("gemini-3.8-flash", "medium"), "gemini-3.8-flash-medium");
 	assert.equal(getAntigravityRequestModelId("gemini-3.8-flash", "high"), "gemini-3.8-flash-high");
 	assert.equal(getAntigravityRequestModelId("gemini-3.8-flash", "xhigh"), "gemini-3.8-flash-high");
+	assert.equal(getAntigravityRequestModelId("gemini-4-argon", "off"), "gemini-4-argon-low");
+	assert.equal(getAntigravityRequestModelId("gemini-4-argon", "low"), "gemini-4-argon-low");
+	assert.equal(getAntigravityRequestModelId("gemini-4-argon", "medium"), "gemini-4-argon-medium");
+	assert.equal(getAntigravityRequestModelId("gemini-4-argon", "high"), "gemini-4-argon-high");
+	assert.equal(getAntigravityRequestModelId("gemini-4-argon", "xhigh"), "gemini-4-argon-high");
 	assert.equal(getAntigravityRequestModelId("gemini-3.5-flash", "off"), "gemini-3.5-flash");
 	assert.equal(getAntigravityRequestModelId("gemini-3.5-flash", "high"), "gemini-3.5-flash");
 	assert.equal(getAntigravityRequestModelId("gemini-3.1-pro", "high"), "gemini-pro-agent");
 	assert.equal(getAntigravityRequestModelId("claude-sonnet-4-6", "high"), "claude-sonnet-4-6");
+	for (const [family, tier] of [
+		["opus", "low"],
+		["opus", "medium"],
+		["opus", "high"],
+		["sonnet", "low"],
+		["sonnet", "medium"],
+		["sonnet", "high"],
+	] as const) {
+		const id = `claude-${family}-5-5-${tier}`;
+		assert.equal(ANTIGRAVITY_ROUTING[id]?.routing?.[tier], id);
+		assert.equal(getAntigravityRequestModelId(id, tier), id);
+	}
 	assert.equal(getAntigravityRequestModelId("unknown-model", "high"), "unknown-model");
 });
 
+test("Claude 5.5 tier requests keep their exact runtime model ids", () => {
+	for (const [family, tier] of [
+		["opus", "low"],
+		["opus", "medium"],
+		["opus", "high"],
+		["sonnet", "low"],
+		["sonnet", "medium"],
+		["sonnet", "high"],
+	] as const) {
+		const id = `claude-${family}-5-5-${tier}`;
+		const model = fakeModel(id);
+		const runtimeModel = getAntigravityRequestModelId(model.id, tier);
+		const request = buildRequest(
+			model,
+			normalizeContext({
+				systemPrompt: "You are pi.",
+				messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+			} as never),
+			"project-1",
+			{ reasoning: tier } as never,
+			runtimeModel,
+		);
+		assert.equal(request.model, id);
+		// Claude's effort tier is encoded in its runtime model ID, not Gemini thinkingConfig.
+		assert.equal(request.request.generationConfig?.thinkingConfig, undefined);
+	}
+});
+
 test("fallback runtime model covers next-gen gemini only", () => {
+	assert.equal(getFallbackRuntimeModel("gemini-4-argon-high"), "gemini-3.8-flash-high");
+	assert.equal(getFallbackRuntimeModel("gemini-4-argon"), "gemini-3.8-flash-low");
 	assert.equal(getFallbackRuntimeModel("gemini-3.8-flash-high"), "gemini-3.7-flash-high");
 	assert.equal(getFallbackRuntimeModel("gemini-3.8-flash"), "gemini-3.7-flash-low");
 	assert.equal(getFallbackRuntimeModel("gemini-3.8-flash-tiered"), "gemini-3.7-flash-low");
@@ -315,6 +393,7 @@ test("max output tokens clamp per runtime id", () => {
 	assert.equal(getMaxOutputTokens("gemini-3.7-flash", "gemini-3.7-flash-high"), 65536);
 	assert.equal(getMaxOutputTokens("gemini-3.8-flash", "gemini-3.8-flash-high"), 65536);
 	assert.equal(getMaxOutputTokens("gemini-3.8-flash", "gemini-3.8-flash-tiered"), 65536);
+	assert.equal(getMaxOutputTokens("gemini-4-argon", "gemini-4-argon-high"), 65536);
 	assert.equal(getMaxOutputTokens("claude-opus-4-6", "claude-opus-4-6-thinking"), 64000);
 	assert.equal(getMaxOutputTokens("gpt-oss-120b", "gpt-oss-120b-medium"), 32768);
 	assert.equal(getMaxOutputTokens("mystery", undefined), 8192);
@@ -329,6 +408,10 @@ test("thinking config per model family", () => {
 	assert.deepEqual(getThinkingConfig("gemini-3.8-flash", "medium"), {
 		includeThoughts: true,
 		thinkingLevel: "MEDIUM",
+	});
+	assert.deepEqual(getThinkingConfig("gemini-4-argon", "high"), {
+		includeThoughts: true,
+		thinkingLevel: "HIGH",
 	});
 	assert.equal(getThinkingConfig("gemini-3.5-flash", "high"), undefined);
 	assert.equal(getThinkingConfig("claude-sonnet-4-6", "high"), undefined);

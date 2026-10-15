@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-10-15
+
+### Added
+- Claude Opus 5.5 and Claude Sonnet 5.5 (Low / Medium / High) catalog entries. Context and output limits are provisional same-family estimates.
+- Provisional `gemini-4-argon` (Low / Medium / High) catalog entry, inferred from runtime ids referenced by Antigravity IDE 2.23.0, with fallback to Gemini 3.8 Flash when the backend rejects it. Limits and pricing are unverified.
+
 ## [0.1.6] - 2026-10-01
 
 ### Fixed

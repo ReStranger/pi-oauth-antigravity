@@ -1,3 +1,4 @@
+import type { ThinkingLevelMap } from "@earendil-works/pi-ai";
 import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import type { AntigravityRouting } from "../types/types.js";
 import { ThinkingEffort } from "../types/enums.js";
@@ -9,13 +10,21 @@ export const PROVIDER_NAME = "Antigravity";
  * Public selectable model IDs → backend request model IDs by thinking effort.
  *
  * Catalog mirrors `agy models` (Antigravity CLI), which currently advertises:
+ * - Gemini 4 Argon (Low / Medium / High) — provisional, see below
  * - Gemini 3.8 Flash (Low / Medium / High)
  * - Gemini 3.7 Flash (Low / Medium / High)
  * - Gemini 3.6 Flash (Low / Medium / High)
  * - Gemini 3.1 Pro (Low / High)
  * - Claude Sonnet 4.6 (Thinking)
  * - Claude Opus 4.6 (Thinking)
+ * - Claude Opus 5.5 (Low / Medium / High)
+ * - Claude Sonnet 5.5 (Low / Medium / High)
  * - GPT-OSS 120B (Medium)
+ *
+ * Gemini 4 Argon is inferred from runtime ids referenced by Antigravity IDE 2.23.0
+ * (`gemini-4-argon-{low,medium,high}`); it is not yet confirmed against a live
+ * `fetchAvailableModels` or `agy models` listing, so its limits and pricing are
+ * provisional and requests fall back to Gemini 3.8 Flash when the backend rejects it.
  *
  * Gemini 3.5 Flash is intentionally omitted from the selectable catalog; the
  * stream handler recognizes the reported retirement notice for old model IDs.
@@ -23,6 +32,17 @@ export const PROVIDER_NAME = "Antigravity";
  * levels advertised by the backend for each model.
  */
 export const ANTIGRAVITY_ROUTING: Record<string, AntigravityRouting> = {
+  "gemini-4-argon": {
+    off: "gemini-4-argon-low",
+    routing: {
+      minimal: "gemini-4-argon-low",
+      low: "gemini-4-argon-low",
+      medium: "gemini-4-argon-medium",
+      high: "gemini-4-argon-high",
+      xhigh: "gemini-4-argon-high",
+    },
+    defaultRequestId: "gemini-4-argon-low",
+  },
   "gemini-3.8-flash": {
     off: "gemini-3.8-flash-low",
     routing: {
@@ -42,6 +62,30 @@ export const ANTIGRAVITY_ROUTING: Record<string, AntigravityRouting> = {
       high: "claude-opus-4-6-thinking",
     },
     defaultRequestId: "claude-opus-4-6-thinking",
+  },
+  "claude-opus-5-5-low": {
+    routing: { low: "claude-opus-5-5-low" },
+    defaultRequestId: "claude-opus-5-5-low",
+  },
+  "claude-opus-5-5-medium": {
+    routing: { medium: "claude-opus-5-5-medium" },
+    defaultRequestId: "claude-opus-5-5-medium",
+  },
+  "claude-opus-5-5-high": {
+    routing: { high: "claude-opus-5-5-high" },
+    defaultRequestId: "claude-opus-5-5-high",
+  },
+  "claude-sonnet-5-5-low": {
+    routing: { low: "claude-sonnet-5-5-low" },
+    defaultRequestId: "claude-sonnet-5-5-low",
+  },
+  "claude-sonnet-5-5-medium": {
+    routing: { medium: "claude-sonnet-5-5-medium" },
+    defaultRequestId: "claude-sonnet-5-5-medium",
+  },
+  "claude-sonnet-5-5-high": {
+    routing: { high: "claude-sonnet-5-5-high" },
+    defaultRequestId: "claude-sonnet-5-5-high",
   },
   // Live fetchAvailableModels exposes `claude-sonnet-4-6` (display: Thinking), not a separate *-thinking id.
   "claude-sonnet-4-6": {
@@ -108,6 +152,11 @@ export const ANTIGRAVITY_ROUTING: Record<string, AntigravityRouting> = {
  * Requesting more than these limits returns a 400 Bad Request from the API.
  */
 export const RUNTIME_MAX_OUTPUT_TOKENS: Record<string, number> = {
+  // Provisional: family fallback, not a verified Gemini 4 limit.
+  "gemini-4-argon": 65536,
+  "gemini-4-argon-low": 65536,
+  "gemini-4-argon-medium": 65536,
+  "gemini-4-argon-high": 65536,
   "gemini-3.8-flash": 65536,
   "gemini-3.8-flash-tiered": 65536,
   "gemini-3.8-flash-low": 65536,
@@ -142,6 +191,7 @@ export function getMaxOutputTokens(modelId: string, runtimeModel?: string): numb
     return RUNTIME_MAX_OUTPUT_TOKENS[modelId];
   }
   if (runtimeModel) {
+    // Unlisted Claude models use a family fallback, not a verified per-model limit.
     if (runtimeModel.startsWith("claude-")) return 64000;
     if (runtimeModel.startsWith("gpt-oss-")) return 32768;
     if (runtimeModel.startsWith("gemini-3.1-pro") || runtimeModel === "gemini-pro-agent")
@@ -187,6 +237,15 @@ const thinkingLevelMaps = {
     xhigh: null,
     max: null,
   },
+  low: {
+    off: null,
+    minimal: null,
+    low: "low",
+    medium: null,
+    high: null,
+    xhigh: null,
+    max: null,
+  },
   medium: {
     off: null,
     minimal: null,
@@ -196,10 +255,54 @@ const thinkingLevelMaps = {
     xhigh: null,
     max: null,
   },
-} satisfies Record<string, ProviderModelConfig["thinkingLevelMap"]>;
+} satisfies Record<string, ThinkingLevelMap>;
 
-/** Same set as `agy models`, collapsed to public Pi model IDs. */
+type Claude55Family = "opus" | "sonnet";
+type Claude55Tier = "low" | "medium" | "high";
+
+const claude55ThinkingLevelMaps: Record<Claude55Tier, ThinkingLevelMap> = {
+  low: thinkingLevelMaps.low,
+  medium: thinkingLevelMaps.medium,
+  high: thinkingLevelMaps.thinking,
+};
+
+/**
+ * Use existing same-family values as provisional estimates only; 5.5-specific
+ * cost, context-window, and output-token metadata has not been verified.
+ */
+function claude55Models(family: Claude55Family): ProviderModelConfig[] {
+  const familyName = family === "opus" ? "Opus" : "Sonnet";
+  const cost = family === "opus" ? claudeOpusCost : claudeSonnetCost;
+  const contextWindow = family === "opus" ? 250000 : 200000;
+
+  return (["low", "medium", "high"] as const).map((tier) => {
+    const tierName = `${tier[0]!.toUpperCase()}${tier.slice(1)}`;
+    return {
+      id: `claude-${family}-5-5-${tier}`,
+      name: `Claude ${familyName} 5.5 (${tierName}) (Antigravity)`,
+      reasoning: true,
+      thinkingLevelMap: claude55ThinkingLevelMaps[tier],
+      input: ["text", "image"],
+      cost,
+      contextWindow,
+      maxTokens: 64000,
+    };
+  });
+}
+
+/** Selectable provider models; effort variants share public IDs where routing supports them. */
 export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
+  {
+    // Provisional: cost (Pro-tier estimate), context window, and max output are unverified.
+    id: "gemini-4-argon",
+    name: "Gemini 4 Argon (Antigravity)",
+    reasoning: true,
+    thinkingLevelMap: thinkingLevelMaps.lowMediumHigh,
+    input: ["text", "image"],
+    cost: geminiProCost,
+    contextWindow: 1048576,
+    maxTokens: 65536,
+  },
   {
     id: "gemini-3.8-flash",
     name: "Gemini 3.8 Flash (Antigravity)",
@@ -240,6 +343,8 @@ export const ANTIGRAVITY_MODELS: ProviderModelConfig[] = [
     contextWindow: 250000,
     maxTokens: 64000,
   },
+  ...claude55Models("opus"),
+  ...claude55Models("sonnet"),
   {
     id: "claude-sonnet-4-6",
     name: "Claude Sonnet 4.6 (Antigravity)",
@@ -309,6 +414,12 @@ export function getAntigravityRequestModelId(modelId: string, effort: string | u
  * provide a fallback runtime model ID (e.g. Gemini 3.6 Flash) to maintain availability.
  */
 export function getFallbackRuntimeModel(runtimeModel: string, effort?: string): string | undefined {
+  if (runtimeModel === "gemini-4-argon") {
+    return "gemini-3.8-flash-low";
+  }
+  if (runtimeModel.startsWith("gemini-4-argon-")) {
+    return runtimeModel.replace("gemini-4-argon-", "gemini-3.8-flash-");
+  }
   if (runtimeModel === "gemini-3.8-flash-tiered") {
     return getAntigravityRequestModelId("gemini-3.7-flash", effort);
   }
@@ -354,6 +465,7 @@ export function getThinkingConfig(
   effort: string | undefined,
 ): ThinkingWire | undefined {
   if (
+    modelId === "gemini-4-argon" ||
     modelId === "gemini-3.7-flash" ||
     modelId === "gemini-3.6-flash" ||
     modelId === "gemini-3.8-flash"
