@@ -1,6 +1,7 @@
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
+import { get } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -52,7 +53,9 @@ import {
 	resetAntigravitySessionMemory,
 	sanitizeText,
 } from "../src/utils/util.js";
-import { getApiKey } from "../src/auth/index.js";
+import { getApiKey, loginAntigravity } from "../src/auth/index.js";
+import { oauthErrorHtml, oauthSuccessHtml } from "../src/auth/callback-page.js";
+import type { AntigravityOAuthCredentials } from "../src/types/types.js";
 import {
 	assertSafeAspectRatio,
 	assertSafeImageModel,
@@ -1567,6 +1570,114 @@ test("getApiKey serializes token + projectId for the stream layer", () => {
 	assert.equal(parsed.projectId, defaultProjectId("antigravity-default"));
 	const withProject = getApiKey({ access: "tok", refresh: "r", expires: 0, projectId: "p9", email: "me@x.com" });
 	assert.equal((JSON.parse(withProject) as { projectId: string }).projectId, "p9");
+});
+
+test("oauth callback pages reuse the stock Pi shell", () => {
+	const success = oauthSuccessHtml("Signed in to Antigravity.");
+	assert.match(success, /^<!doctype html>/);
+	assert.match(success, /<title>Authentication successful<\/title>/);
+	assert.match(success, /<h1>Authentication successful<\/h1>/);
+	assert.match(success, /<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
+	assert.ok(success.includes("<p>Signed in to Antigravity.</p>"));
+
+	const failure = oauthErrorHtml("Antigravity sign-in failed.", 'Error: <script>alert("x")</script>');
+	assert.match(failure, /<title>Authentication failed<\/title>/);
+	assert.ok(failure.includes("&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;"));
+	assert.doesNotMatch(failure, /<script>/);
+});
+
+/** Plain HTTP GET so the fetch stub installed for the token calls cannot intercept it. */
+async function getCallbackPage(url: string): Promise<{ status: number; body: string }> {
+	return await new Promise((resolve, reject) => {
+		const request = get(url, (response) => {
+			let body = "";
+			response.setEncoding("utf8");
+			response.on("data", (chunk: string) => {
+				body += chunk;
+			});
+			response.on("end", () => resolve({ status: response.statusCode ?? 0, body }));
+		});
+		request.on("error", reject);
+	});
+}
+
+async function waitForValue<T>(read: () => T | undefined, label: string): Promise<T> {
+	const deadline = Date.now() + 10_000;
+	while (Date.now() < deadline) {
+		const value = read();
+		if (value !== undefined) return value;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	throw new Error(`Timed out waiting for ${label}`);
+}
+
+/**
+ * Start a real login against the local callback server (token exchange stubbed)
+ * and hand the test the authorization URL plus the pending login promise.
+ */
+async function withPendingLogin(
+	run: (context: { authUrl: string; login: Promise<AntigravityOAuthCredentials> }) => Promise<void>,
+): Promise<void> {
+	await withFetchStub(
+		(url) => {
+			if (url.includes("oauth2.googleapis.com/token")) {
+				return Response.json({ access_token: "access-1", refresh_token: "refresh-1", expires_in: 3600 });
+			}
+			if (url.includes("oauth2/v1/userinfo")) return Response.json({ email: "tester@example.com" });
+			return Response.json({});
+		},
+		async () => {
+			let authUrl: string | undefined;
+			const login = loginAntigravity({
+				onAuth: (info) => {
+					authUrl = info.url;
+				},
+				onDeviceCode: () => {},
+				// Unused: the browser callback must win the race against the paste path.
+				onPrompt: () => new Promise<string>(() => {}),
+				onSelect: async () => undefined,
+			});
+			await run({ authUrl: await waitForValue(() => authUrl, "the authorization URL"), login });
+		},
+	);
+}
+
+test("oauth callback server answers the browser with the success page, not plain text", async () => {
+	await withPendingLogin(async ({ authUrl, login }) => {
+		const state = new URL(authUrl).searchParams.get("state");
+		assert.ok(state);
+
+		const completed = await getCallbackPage(
+			`http://127.0.0.1:51121/oauth-callback?code=c2&state=${encodeURIComponent(state)}`,
+		);
+		assert.equal(completed.status, 200);
+		assert.match(completed.body, /<h1>Authentication successful<\/h1>/);
+		assert.match(
+			completed.body,
+			/Signed in to Antigravity\. You can now close this window and return to Pi\./,
+		);
+		assert.doesNotMatch(completed.body, /text\/plain/);
+
+		const credentials = await login;
+		assert.equal(credentials.refresh, "refresh-1");
+		assert.equal(credentials.email, "tester@example.com");
+	});
+});
+
+test("oauth callback server renders the failure page for a foreign callback", async () => {
+	await withPendingLogin(async ({ login }) => {
+		// A foreign callback still aborts the (single-use) local wait; attach the expectation
+		// before the request so the rejection cannot go unhandled.
+		const aborted = assert.rejects(login, /OAuth state mismatch/);
+		const mismatched = await getCallbackPage(
+			"http://127.0.0.1:51121/oauth-callback?code=c1&state=nope",
+		);
+		assert.equal(mismatched.status, 400);
+		assert.match(mismatched.body, /<title>Authentication failed<\/title>/);
+		assert.match(mismatched.body, /State mismatch/);
+		assert.doesNotMatch(mismatched.body, /Authentication successful/);
+		await aborted;
+	});
 });
 
 /* -------------------------------- image.ts ------------------------------- */

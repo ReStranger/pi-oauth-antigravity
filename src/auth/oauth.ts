@@ -1,9 +1,10 @@
 import { createHash, randomBytes } from "node:crypto";
-import { createServer, type Server } from "node:http";
+import { createServer, type Server, type ServerResponse } from "node:http";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { defaultProjectId, loadCodeAssist } from "../client/client.js";
-import { escapeHtml, antigravityEnv } from "../utils/util.js";
+import { antigravityEnv } from "../utils/util.js";
 import { resolveCallbackHost, redactSecrets } from "../utils/security.js";
+import { oauthErrorHtml, oauthSuccessHtml } from "./callback-page.js";
 import type { AntigravityOAuthCredentials, CallbackServer } from "../types/types.js";
 
 export const REDIRECT_URI = "http://localhost:51121/oauth-callback";
@@ -43,6 +44,11 @@ function oauthCallbackHeaders(contentType = "text/html; charset=utf-8"): Record<
       "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'",
     "Referrer-Policy": "no-referrer",
   };
+}
+
+function sendCallbackPage(res: ServerResponse, status: number, html: string): void {
+  res.writeHead(status, oauthCallbackHeaders());
+  res.end(html);
 }
 
 function sanitizeOAuthProviderError(text: string): string {
@@ -112,15 +118,17 @@ function startCallbackServer(expectedState: string): Promise<CallbackServer> {
 
     const server = createServer((req, res) => {
       if (req.method !== "GET" && req.method !== "HEAD") {
-        res.writeHead(405, oauthCallbackHeaders("text/plain; charset=utf-8"));
-        res.end("Method Not Allowed");
+        sendCallbackPage(
+          res,
+          405,
+          oauthErrorHtml("Method not allowed.", "The OAuth callback only accepts GET requests."),
+        );
         return;
       }
 
       const url = new URL(req.url || "", REDIRECT_URI);
       if (url.pathname !== "/oauth-callback") {
-        res.writeHead(404, oauthCallbackHeaders());
-        res.end("Antigravity OAuth callback route not found.");
+        sendCallbackPage(res, 404, oauthErrorHtml("Callback route not found."));
         return;
       }
 
@@ -128,27 +136,42 @@ function startCallbackServer(expectedState: string): Promise<CallbackServer> {
       const code = url.searchParams.get("code");
       const state = url.searchParams.get("state");
       if (error) {
-        const safe = escapeHtml(error.slice(0, 200));
-        res.writeHead(400, oauthCallbackHeaders());
-        res.end(`Antigravity authentication failed: ${safe}`);
-        finish(() => rejectCode(new Error(`OAuth error: ${error.slice(0, 200)}`)));
+        const detail = error.slice(0, 200);
+        sendCallbackPage(
+          res,
+          400,
+          oauthErrorHtml("Google sign-in was not completed.", `Error: ${detail}`),
+        );
+        finish(() => rejectCode(new Error(`OAuth error: ${detail}`)));
         return;
       }
       if (!code || !state) {
-        res.writeHead(400, oauthCallbackHeaders());
-        res.end("Antigravity authentication failed: missing code or state.");
+        sendCallbackPage(
+          res,
+          400,
+          oauthErrorHtml("Antigravity sign-in failed.", "Missing code or state in the callback."),
+        );
         finish(() => rejectCode(new Error("Missing code or state in OAuth callback")));
         return;
       }
       if (state !== expectedState) {
-        res.writeHead(400, oauthCallbackHeaders());
-        res.end("Antigravity authentication failed: invalid state.");
+        sendCallbackPage(
+          res,
+          400,
+          oauthErrorHtml(
+            "Antigravity sign-in failed.",
+            "State mismatch: this callback belongs to a different sign-in. Re-run /login antigravity.",
+          ),
+        );
         finish(() => rejectCode(new Error("OAuth state mismatch")));
         return;
       }
 
-      res.writeHead(200, oauthCallbackHeaders());
-      res.end("Antigravity authentication complete. You can close this window and return to Pi.");
+      sendCallbackPage(
+        res,
+        200,
+        oauthSuccessHtml("Signed in to Antigravity. You can now close this window and return to Pi."),
+      );
       finish(() => resolveCode({ code, state }));
     });
 

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The OAuth callback browser page now renders the same styled shell stock Pi renders for its own provider logins (Pi logo, "Authentication successful" heading, dark page) instead of a bare text line, so a finished sign-in looks like Pi rather than an unstyled page. Every outcome is covered: success (200), provider error / missing code / state mismatch (400), wrong route (404) and wrong method (405) all render the matching success or failure page. Dynamic values (the provider's `error` parameter) go through the shared HTML escaper, so a crafted callback URL still cannot inject markup.
+
 ## [0.1.8] - 2026-10-15
 
 ### Fixed
