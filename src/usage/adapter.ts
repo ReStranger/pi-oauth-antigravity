@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type {
+  AccountStatus,
   UsageAccount,
   UsageMetric,
   UsageModelPool,
@@ -167,11 +168,17 @@ export function convertUsageToAccount(usage: AccountUsage): UsageAccount {
     });
   }
 
+  const hasPools = pools.length > 0;
+  const isError = !hasPools && Boolean(usage.quotaSummaryError);
+  const status: AccountStatus = isError ? "error" : "ready";
+  const errorMessage = isError ? usage.quotaSummaryError : undefined;
+
   return {
     id: usage.projectId || "antigravity-active",
     name: "Account",
     email: usage.email,
-    status: "ready",
+    status,
+    errorMessage,
     isActive: true,
     lastUpdated: usage.fetchedAt || Date.now(),
     pools,
