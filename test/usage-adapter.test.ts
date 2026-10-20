@@ -143,6 +143,23 @@ test("convertUsageToAccount synthesizes pools from models when quota groups are 
   assert.equal(claude.buckets[0]?.isPrimary, true);
 });
 
+test("convertUsageToAccount preserves quotaSummaryError and sets status to error when pools are empty", () => {
+  const usage: AccountUsage = {
+    projectId: "failed-proj",
+    endpoint: "https://cloudcode-pa.googleapis.com",
+    groups: [],
+    quotaSummaryError: "403 SUBSCRIPTION_REQUIRED",
+    models: [],
+    fetchedAt: 1700000000000,
+  };
+
+  const account = convertUsageToAccount(usage);
+  assert.equal(account.id, "failed-proj");
+  assert.equal(account.status, "error");
+  assert.equal(account.errorMessage, "403 SUBSCRIPTION_REQUIRED");
+  assert.equal(account.pools.length, 0);
+});
+
 test("createAntigravityUsageAdapter returns auth-required when no credentials exist", async () => {
   const tmpAgentDir = mkdtempSync(join(tmpdir(), "pi-usage-test-"));
   const prevEnv = process.env.PI_CODING_AGENT_DIR;
