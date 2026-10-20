@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Replaced the `/antigravity.usage` command with native integration for [`pi-usage-core`](https://github.com/ReStranger/pi-usage-core). Antigravity quota pools (Gemini 5h/weekly, Claude+GPT 5h) and account details are now registered automatically into Pi's unified `/usage` dashboard and persistent footer status line via `pi.events` and `globalThis.__PI_USAGE__`.
+- Updated `/antigravity.doctor` diagnostics to reflect available commands (`/antigravity.models`, `/antigravity.doctor`, `/antigravity.image`).
+
+
 ## [0.1.8] - 2026-10-15
 
 ### Fixed

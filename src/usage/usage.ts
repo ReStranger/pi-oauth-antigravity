@@ -1,4 +1,7 @@
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import type { ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
   antigravityHeaders,
   endpointCandidates,
@@ -360,6 +363,7 @@ export async function fetchAccountUsage(apiKeyRaw?: string): Promise<AccountUsag
   return {
     projectId,
     endpoint: summary?.endpoint ?? available.endpoint ?? assistResult?.endpoint,
+    email: creds.email,
     productTier,
     paidTier,
     planLabel,
@@ -444,11 +448,33 @@ export function formatModelsList(usage: AccountUsage, opts?: { all?: boolean }):
 }
 
 export async function resolveApiKeyFromContext(
-  ctx: ExtensionCommandContext,
+  ctx: ExtensionContext | ExtensionCommandContext,
 ): Promise<string | undefined> {
   try {
-    return await ctx.modelRegistry.getApiKeyForProvider("antigravity");
+    const key = await ctx.modelRegistry.getApiKeyForProvider("antigravity");
+    if (key) return key;
   } catch {
-    return undefined;
+    // continue to fallback
   }
+
+  try {
+    const authPath = join(getAgentDir(), "auth.json");
+    if (existsSync(authPath)) {
+      const data = JSON.parse(readFileSync(authPath, "utf-8")) as Record<string, unknown>;
+      const ag = data.antigravity as
+        | { access?: string; projectId?: string; email?: string }
+        | undefined;
+      if (ag && ag.access && ag.projectId) {
+        return JSON.stringify({
+          token: ag.access,
+          projectId: ag.projectId,
+          ...(ag.email ? { email: ag.email } : {}),
+        });
+      }
+    }
+  } catch {
+    // Ignore fallback errors
+  }
+
+  return undefined;
 }
