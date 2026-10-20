@@ -116,8 +116,8 @@ async function fetchAvailableModelsFromEndpoint(
   token: string,
   projectId: string,
 ): Promise<{ endpoint: string; status: number; data: unknown } | undefined> {
-  // `{}` and `{ project: projectId }` return byte-identical catalogs on this endpoint
-  // (verified against the live backend) — one body is the full search space per host.
+  // `{}` and `{ project: projectId }` return byte-identical catalogs on this endpoint,
+  // verified against the live backend. One body is the full search space per host.
   try {
     const res = await antigravityFetch(`${endpoint}/v1internal:fetchAvailableModels`, {
       method: "POST",
@@ -147,13 +147,13 @@ async function fetchAvailableModelsFromEndpoint(
 
 /**
  * Merge fetchAvailableModels across endpoint candidates so daily/sandbox-only
- * models (e.g. Gemini 3.6 Flash) appear alongside production catalog entries.
+ * models, such as Gemini 3.6 Flash, appear alongside production catalog entries.
  */
 async function fetchMergedAvailableModels(
   token: string,
   projectId: string,
 ): Promise<{ endpoint: string; status: number; data: AvailableModelsRaw }> {
-  // Both endpoints are always queried to merge their catalogs — fetch them concurrently
+  // Both endpoints are always queried to merge their catalogs. Fetch them concurrently
   // instead of blocking on production before starting the daily/sandbox request.
   const results = await Promise.all(
     endpointCandidates().map((endpoint) =>
@@ -296,8 +296,8 @@ async function loadCodeAssistSafe(token: string) {
 
 /**
  * The user-quota-summary RPC is gated behind a paid subscription: free-tier
- * accounts get 403 SUBSCRIPTION_REQUIRED (#3501). It is best-effort diagnostics
- * only — never let it block the rest of the account data (models, tier, project).
+ * accounts get 403 SUBSCRIPTION_REQUIRED (#3501). It only provides diagnostics,
+ * so never let it block the rest of the account data (models, tier, project).
  */
 async function fetchQuotaSummarySafe(token: string): Promise<
   | { ok: true; result: { endpoint: string; status: number; data: unknown } }
@@ -353,7 +353,7 @@ export async function fetchAccountUsage(apiKeyRaw?: string): Promise<AccountUsag
   const paidTier = parseTier(assistData.paidTier);
 
   // Google returns currentTier=free-tier even for Google AI Pro accounts.
-  // The real subscription lives in paidTier (e.g. g1-pro-tier / Google AI Pro).
+  // The real subscription lives in paidTier, for example g1-pro-tier / Google AI Pro.
   const planLabel = paidTier?.name
     ? `${paidTier.name}${paidTier.id ? ` (${paidTier.id})` : ""}`
     : productTier?.name

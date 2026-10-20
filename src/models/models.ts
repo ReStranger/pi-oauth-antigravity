@@ -10,7 +10,7 @@ export const PROVIDER_NAME = "Antigravity";
  * Public selectable model IDs → backend request model IDs by thinking effort.
  *
  * Catalog mirrors `agy models` (Antigravity CLI), which currently advertises:
- * - Gemini 4 Argon (Low / Medium / High) — provisional, see below
+ * - Gemini 4 Argon (Low / Medium / High). Provisional, see below.
  * - Gemini 3.8 Flash (Low / Medium / High)
  * - Gemini 3.7 Flash (Low / Medium / High)
  * - Gemini 3.6 Flash (Low / Medium / High)
@@ -410,8 +410,8 @@ export function getAntigravityRequestModelId(modelId: string, effort: string | u
 }
 
 /**
- * If a next-gen model (e.g. Gemini 3.7 Flash) is not yet available on the backend,
- * provide a fallback runtime model ID (e.g. Gemini 3.6 Flash) to maintain availability.
+ * If the backend does not serve a next-gen model yet, such as Gemini 3.7 Flash,
+ * provide a fallback runtime model ID, such as Gemini 3.6 Flash, so requests still run.
  */
 export function getFallbackRuntimeModel(runtimeModel: string, effort?: string): string | undefined {
   if (runtimeModel === "gemini-4-argon") {

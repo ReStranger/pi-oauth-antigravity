@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,6 +11,18 @@ import {
 import { resolveApiKeyFromContext } from "../src/usage/usage.js";
 import type { AccountUsage } from "../src/types/types.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+
+// Never let a developer's env redirect these tests at a real account store.
+const previousAccountsFile = process.env.ANTIGRAVITY_ACCOUNTS_FILE;
+const previousNoagyAccountsFile = process.env.NOAGY_ACCOUNTS_FILE;
+delete process.env.ANTIGRAVITY_ACCOUNTS_FILE;
+delete process.env.NOAGY_ACCOUNTS_FILE;
+after(() => {
+  if (previousAccountsFile === undefined) delete process.env.ANTIGRAVITY_ACCOUNTS_FILE;
+  else process.env.ANTIGRAVITY_ACCOUNTS_FILE = previousAccountsFile;
+  if (previousNoagyAccountsFile === undefined) delete process.env.NOAGY_ACCOUNTS_FILE;
+  else process.env.NOAGY_ACCOUNTS_FILE = previousNoagyAccountsFile;
+});
 
 test("convertUsageToAccount maps quota groups into UsageModelPools and primary buckets", () => {
   const usage: AccountUsage = {
@@ -61,8 +73,8 @@ test("convertUsageToAccount maps quota groups into UsageModelPools and primary b
 
   const account = convertUsageToAccount(usage);
 
-  assert.equal(account.id, "proj-123");
-  assert.equal(account.name, "Account");
+  assert.equal(account.id, "dev@example.com");
+  assert.equal(account.name, "dev@example.com");
   assert.equal(account.email, "dev@example.com");
   assert.equal(account.status, "ready");
   assert.equal(account.isActive, true);
@@ -104,7 +116,7 @@ test("convertUsageToAccount maps quota groups into UsageModelPools and primary b
   assert.ok(account.metrics?.some((m) => m.id === "default-model" && m.value === "gemini-3.8-flash"));
 });
 
-test("convertUsageToAccount synthesizes pools from models when quota groups are empty (e.g. Free Tier)", () => {
+test("convertUsageToAccount synthesizes pools from models when quota groups are empty (for example Free Tier)", () => {
   const usage: AccountUsage = {
     projectId: "free-proj",
     endpoint: "https://cloudcode-pa.googleapis.com",
@@ -159,6 +171,32 @@ test("convertUsageToAccount preserves quotaSummaryError and sets status to error
   assert.equal(account.status, "error");
   assert.equal(account.errorMessage, "403 SUBSCRIPTION_REQUIRED");
   assert.equal(account.pools.length, 0);
+});
+
+test("convertUsageToAccount prefers the stored account identity over the backend payload", () => {
+  const usage: AccountUsage = {
+    projectId: "proj-x",
+    email: "ignored@example.com",
+    groups: [],
+    models: [],
+    fetchedAt: 1700000000000,
+  };
+
+  const active = convertUsageToAccount(usage, {
+    email: "store@example.com",
+    activeEmail: "store@example.com",
+  });
+  assert.equal(active.id, "store@example.com");
+  assert.equal(active.name, "store@example.com");
+  assert.equal(active.email, "store@example.com");
+  assert.equal(active.isActive, true);
+
+  const inactive = convertUsageToAccount(usage, {
+    email: "store@example.com",
+    activeEmail: "other@example.com",
+  });
+  assert.equal(inactive.id, "store@example.com");
+  assert.equal(inactive.isActive, false);
 });
 
 test("createAntigravityUsageAdapter returns auth-required when no credentials exist", async () => {

@@ -28,6 +28,22 @@ export type AntigravityApiKey = {
   email?: string;
 };
 
+// Multi-account storage (antigravity-accounts.json)
+export type AntigravityAccount = {
+  email: string;
+  refresh: string;
+  access: string;
+  expires: number;
+  projectId: string;
+  addedAt: number;
+  lastUsedAt: number;
+};
+
+export type AntigravityAccountsState = {
+  activeEmail?: string;
+  accounts: AntigravityAccount[];
+};
+
 export type DynamicModelInfo = {
   id: string;
   experiments?: string[];
@@ -229,7 +245,7 @@ export type AccountUsage = {
   planLabel?: string;
   groups: QuotaGroup[];
   groupDescription?: string;
-  /** Set when the (subscription-gated) quota-summary RPC was unavailable, e.g. free-tier SUBSCRIPTION_REQUIRED. */
+  /** Set when the subscription-gated quota-summary RPC is unavailable, for example a free-tier SUBSCRIPTION_REQUIRED error. */
   quotaSummaryError?: string;
   models: ModelQuotaRow[];
   defaultAgentModelId?: string;

@@ -11,9 +11,22 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import { registerApiProvider } from "@earendil-works/pi-ai/compat";
-import { getApiKey, loginAntigravity, refreshAntigravityToken } from "./auth/index.js";
+import {
+  accountTokenExpired,
+  getActiveAccount,
+  getApiKey,
+  loadAccountsState,
+  loginAntigravity,
+  refreshAntigravityToken,
+  removeAccount,
+  switchActiveAccount,
+} from "./auth/index.js";
 import { DEFAULT_ENDPOINT, endpointCandidates } from "./client/index.js";
-import { getLastDiagnostics, runWithDiagnostics } from "./diagnostics/index.js";
+import {
+  getLastAccountFailover,
+  getLastDiagnostics,
+  runWithDiagnostics,
+} from "./diagnostics/index.js";
 import {
   DEFAULT_IMAGE_MODEL,
   generateAntigravityImage,
@@ -28,7 +41,16 @@ import {
   registerAntigravityUsageAdapter,
   resolveApiKeyFromContext,
 } from "./usage/index.js";
-import { prewarmConnection, redactSecrets } from "./utils/index.js";
+import { maskEmail, prewarmConnection, redactSecrets } from "./utils/index.js";
+
+function formatTimeDistance(timestamp: number, now: number): string {
+  if (!Number.isFinite(timestamp)) return "unknown";
+  const minutes = Math.max(0, Math.round((now - timestamp) / 60000));
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours}h`;
+  return `${Math.round(hours / 24)}d`;
+}
 
 /**
  * Pi's interactive `notify` writes into the chat transcript. `console.log` in that
@@ -110,6 +132,7 @@ export default function (pi: ExtensionAPI): void {
     description: "Show sanitized Antigravity provider diagnostics",
     handler: async (_args, ctx) => {
       const d = getLastDiagnostics();
+      const failover = getLastAccountFailover();
       const lines = [
         `provider=${PROVIDER_ID}`,
         `lastResolvedRuntimeModel=${d.resolvedRuntimeModel || "none"}`,
@@ -118,13 +141,103 @@ export default function (pi: ExtensionAPI): void {
         `lastEndpoint=${d.endpoint || "none"}`,
         `lastStatus=${d.status ?? "none"}`,
         `lastProjectId=${d.projectId || "none"}`,
+        ...(failover
+          ? [
+              `accountFailover=${maskEmail(failover.from) ?? "unknown"} -> ${
+                maskEmail(failover.to) ?? "unknown"
+              }`,
+            ]
+          : []),
         ...(d.latencyMs !== undefined ? [`lastLatencyMs=${d.latencyMs}`] : []),
         `lastError=${d.error ? redactSecrets(d.error) : "none"}`,
         "transport=native-streamSimple",
         "runtimeCli=not-used",
-        "commands=/antigravity.models /antigravity.doctor /antigravity.image",
+        "commands=/antigravity.models /antigravity.doctor /antigravity.accounts /antigravity.image",
       ];
       emitCommandOutput(ctx, `Antigravity doctor\n${lines.join("\n")}`);
+    },
+  });
+
+  pi.registerCommand("antigravity.accounts", {
+    description: "List saved Antigravity accounts; switch active / remove (interactive)",
+    handler: async (_args, ctx) => {
+      const state = loadAccountsState();
+      if (!state.accounts.length) {
+        emitCommandOutput(
+          ctx,
+          "No saved Antigravity accounts. Run /login antigravity to add one.",
+          "warning",
+        );
+        return;
+      }
+      const active = getActiveAccount();
+      const activeEmail = active?.email;
+      const now = Date.now();
+      const lines = state.accounts.map((account) => {
+        const marker = account.email === activeEmail ? "✓" : " ";
+        const tokenState = accountTokenExpired(account) ? "expired" : "ready";
+        return `${marker} ${account.email}  ·  ${tokenState} token · project ${account.projectId} · added ${formatTimeDistance(account.addedAt, now)} ago · last used ${formatTimeDistance(account.lastUsedAt, now)} ago`;
+      });
+      emitCommandOutput(ctx, `Antigravity accounts\n${lines.join("\n")}`);
+      if (!ctx.hasUI) return;
+
+      // Interactive maintenance menu (labels map back to actions by index).
+      const switchCandidates = state.accounts
+        .filter((account) => account.email !== activeEmail)
+        .map((account) => ({ label: `Switch to ${account.email}`, email: account.email }));
+      const options: string[] = [
+        "Add another Google account (via /login)",
+        ...switchCandidates.map((entry) => entry.label),
+      ];
+      if (state.accounts.length > 1) {
+        options.push("Remove an account…");
+      }
+      const choice = await ctx.ui.select("Antigravity accounts", options);
+      if (!choice) return;
+      if (choice.startsWith("Add another Google account")) {
+        emitCommandOutput(
+          ctx,
+          "Run /login antigravity and pick \"Add another Google account\" in the login menu.",
+        );
+        return;
+      }
+      const switchTarget = switchCandidates.find((entry) => entry.label === choice);
+      if (switchTarget) {
+        try {
+          await switchActiveAccount(switchTarget.email);
+          emitCommandOutput(ctx, `Active Antigravity account: ${switchTarget.email}`);
+        } catch (error) {
+          emitCommandOutput(
+            ctx,
+            `Failed to switch account: ${error instanceof Error ? error.message : String(error)}`,
+            "error",
+          );
+        }
+        return;
+      }
+      if (choice.startsWith("Remove an account")) {
+        const removable = state.accounts.map((account) => account.email);
+        const target = await ctx.ui.select("Remove which account?", removable);
+        if (!target) return;
+        if (target === activeEmail) {
+          const confirmed = await ctx.ui.confirm(
+            "Remove the active account?",
+            "Pi will switch to the next saved Antigravity account.",
+          );
+          if (!confirmed) return;
+        }
+        const removed = await removeAccount(target);
+        if (removed) {
+          // Re-read: the pre-removal snapshot no longer describes the next active account.
+          const nextActive = loadAccountsState().activeEmail;
+          emitCommandOutput(
+            ctx,
+            `Removed ${target}.${nextActive ? ` Active account: ${nextActive}` : " No accounts left. Run /login antigravity."}`,
+          );
+        } else {
+          emitCommandOutput(ctx, `Account ${target} not found.`, "warning");
+        }
+      }
     },
   });
 

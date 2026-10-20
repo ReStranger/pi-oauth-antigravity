@@ -10,7 +10,14 @@ import type {
 import { PROVIDER_ID } from "../models/models.js";
 import { runWithDiagnostics } from "../diagnostics/diagnostics.js";
 import { fetchAccountUsage, resolveApiKeyFromContext } from "./usage.js";
-import type { AccountUsage } from "../types/types.js";
+import {
+  accountToApiKey,
+  accountTokenExpired,
+  loadAccountsState,
+  switchActiveAccount,
+} from "../auth/accounts.js";
+import { refreshAccount } from "../auth/oauth.js";
+import type { AntigravityAccount, AccountUsage } from "../types/types.js";
 
 declare global {
   var __PI_USAGE__:
@@ -21,7 +28,16 @@ declare global {
     | undefined;
 }
 
-export function convertUsageToAccount(usage: AccountUsage): UsageAccount {
+/** Adapter exposes account switching on top of the standard interface. */
+export type AntigravityUsageAdapter = UsageProviderAdapter & {
+  /** Make a saved account active and mirror it into auth.json. */
+  switchAccount(accountId: string): Promise<AntigravityAccount>;
+};
+
+export function convertUsageToAccount(
+  usage: AccountUsage,
+  options: { activeEmail?: string; email?: string } = {},
+): UsageAccount {
   const pools: UsageModelPool[] = [];
 
   for (const group of usage.groups) {
@@ -80,8 +96,8 @@ export function convertUsageToAccount(usage: AccountUsage): UsageAccount {
     });
   }
 
-  // Fallback: if groups is empty (e.g. free tier accounts without retrieveUserQuotaSummary access),
-  // extract quota buckets from models catalog
+  // Some accounts, such as free-tier ones without retrieveUserQuotaSummary access, return
+  // no groups. In that case, extract quota buckets from the models catalog.
   if (pools.length === 0 && usage.models.length > 0) {
     const geminiModels = usage.models.filter(
       (m) => m.modelId.startsWith("gemini") && m.remainingFraction !== undefined,
@@ -172,55 +188,121 @@ export function convertUsageToAccount(usage: AccountUsage): UsageAccount {
   const isError = !hasPools && Boolean(usage.quotaSummaryError);
   const status: AccountStatus = isError ? "error" : "ready";
   const errorMessage = isError ? usage.quotaSummaryError : undefined;
+  // Identity comes from the store when polling a saved account: the backend may
+  // omit the email, and a missing/renamed email would change the dashboard id and
+  // break the accountId -> stored account mapping used for switching.
+  const email = options.email || usage.email;
+  const id = email || usage.projectId || "antigravity-active";
 
   return {
-    id: usage.projectId || "antigravity-active",
-    name: "Account",
-    email: usage.email,
+    id,
+    name: email || id,
+    email,
     status,
     errorMessage,
-    isActive: true,
+    // Without an active-email hint (legacy single-account path) keep the old
+    // behavior of marking the one account as active.
+    isActive: options.activeEmail ? Boolean(email) && email === options.activeEmail : true,
     lastUpdated: usage.fetchedAt || Date.now(),
     pools,
     metrics,
   };
 }
 
-export function createAntigravityUsageAdapter(): UsageProviderAdapter {
+function usageAccountForError(
+  account: AntigravityAccount,
+  message: string,
+  status: AccountStatus,
+  activeEmail?: string,
+): UsageAccount {
+  const id = account.email || account.projectId;
+  return {
+    id,
+    name: id,
+    email: account.email,
+    status,
+    errorMessage: message,
+    isActive: activeEmail ? account.email === activeEmail : true,
+    pools: [],
+    lastUpdated: Date.now(),
+  };
+}
+
+async function fetchOneAccountUsage(
+  account: AntigravityAccount,
+  activeEmail?: string,
+): Promise<UsageAccount> {
+  try {
+    // Secondary (inactive) accounts keep their own tokens fresh during usage
+    // polling so failover can switch to them instantly.
+    let current = account;
+    if (accountTokenExpired(current)) {
+      try {
+        current = await refreshAccount(current);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return usageAccountForError(current, `Token refresh failed: ${msg}`, "auth-required", activeEmail);
+      }
+    }
+    const usage = await runWithDiagnostics(() => fetchAccountUsage(accountToApiKey(current)));
+    return convertUsageToAccount(usage, { activeEmail, email: current.email });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return usageAccountForError(account, msg, "error", activeEmail);
+  }
+}
+
+export function createAntigravityUsageAdapter(): AntigravityUsageAdapter {
   return {
     id: PROVIDER_ID,
     displayName: "Google Antigravity",
 
     async getAccounts(ctx: ExtensionContext): Promise<UsageAccount[]> {
-      const apiKey = await resolveApiKeyFromContext(ctx);
-      if (!apiKey) {
-        return [
-          {
-            id: "antigravity-default",
-            name: "Google Antigravity",
-            status: "auth-required",
-            errorMessage: "No Antigravity credentials found. Run /login antigravity first.",
-            pools: [],
-            lastUpdated: Date.now(),
-          },
-        ];
+      // Legacy path. With no saved accounts in the store, keep the single-account
+      // behavior driven by auth.json, which covers users that never migrated.
+      const state = loadAccountsState();
+      if (state.accounts.length === 0) {
+        const activeEmail = state.activeEmail;
+        const apiKey = await resolveApiKeyFromContext(ctx);
+        if (!apiKey) {
+          return [
+            {
+              id: "antigravity-default",
+              name: "Google Antigravity",
+              status: "auth-required",
+              errorMessage: "No Antigravity credentials found. Run /login antigravity first.",
+              pools: [],
+              lastUpdated: Date.now(),
+            },
+          ];
+        }
+
+        try {
+          const usage = await runWithDiagnostics(() => fetchAccountUsage(apiKey));
+          return [convertUsageToAccount(usage, { activeEmail })];
+        } catch (err) {
+          return [
+            {
+              id: "antigravity-error",
+              name: "Google Antigravity",
+              status: "error",
+              errorMessage: err instanceof Error ? err.message : String(err),
+              pools: [],
+              lastUpdated: Date.now(),
+            },
+          ];
+        }
       }
 
-      try {
-        const usage = await runWithDiagnostics(() => fetchAccountUsage(apiKey));
-        return [convertUsageToAccount(usage)];
-      } catch (err) {
-        return [
-          {
-            id: "antigravity-error",
-            name: "Google Antigravity",
-            status: "error",
-            errorMessage: err instanceof Error ? err.message : String(err),
-            pools: [],
-            lastUpdated: Date.now(),
-          },
-        ];
-      }
+      const activeEmail = state.activeEmail;
+      // Poll every account concurrently: the dashboard shows one tab per account.
+      return Promise.all(
+        state.accounts.map((account) => fetchOneAccountUsage(account, activeEmail)),
+      );
+    },
+
+    async switchAccount(accountId: string): Promise<AntigravityAccount> {
+      return switchActiveAccount(accountId);
     },
 
     async refresh(ctx: ExtensionContext): Promise<UsageAccount[]> {
@@ -229,13 +311,26 @@ export function createAntigravityUsageAdapter(): UsageProviderAdapter {
   };
 }
 
-export function registerAntigravityUsageAdapter(pi: ExtensionAPI): UsageProviderAdapter {
+export function registerAntigravityUsageAdapter(pi: ExtensionAPI): AntigravityUsageAdapter {
   const adapter = createAntigravityUsageAdapter();
 
   pi.events.emit("pi-usage:register", adapter);
 
   pi.events.on("pi-usage:discover", () => {
     pi.events.emit("pi-usage:register", adapter);
+  });
+
+  // Forward-compatible hook: pi-usage-core 0.1.0 has no switch event yet, so
+  // nothing emits this today. Account ids are emails. Kept so a dashboard that
+  // adds pi-usage:switch-account starts working without a release here.
+  pi.events.on("pi-usage:switch-account", (data: unknown) => {
+    const payload = data as { providerId?: string; accountId?: string } | undefined;
+    if (!payload || payload.providerId !== PROVIDER_ID || typeof payload.accountId !== "string") {
+      return;
+    }
+    void switchActiveAccount(payload.accountId).catch(() => {
+      // Ignore an unknown or stale accountId. The dashboard state stays unchanged.
+    });
   });
 
   if (globalThis.__PI_USAGE__?.register) {

@@ -11,9 +11,11 @@ import {
   type ToolCall,
 } from "@earendil-works/pi-ai";
 import {
+  asJsonSchemaValue,
   getJsonSchemaToolParameters,
   requiresToolCallId,
   resolveJsonSchemaStrictSampling,
+  type JsonSchemaValue,
 } from "./provider-helpers.js";
 import { getCurrentSystemPrompt, getCurrentTools } from "./transcript.js";
 import {
@@ -30,6 +32,7 @@ import {
 import {
   getCurrentEndpoint,
   runWithDiagnostics,
+  setLastAccountFailover,
   setLastEndpoint,
   setLastError,
   setLastLatencyMs,
@@ -57,6 +60,7 @@ import { redactSecrets, safeError } from "../utils/security.js";
 import {
   ANTIGRAVITY_API,
   type ActiveBlock,
+  type AntigravityAccount,
   type AntigravityGenerateRequest,
   type AntigravityStreamOptions,
   type ContentBlock,
@@ -78,10 +82,18 @@ import {
   getOrCreateAntigravitySession,
   isRecord,
   persistAntigravitySessions,
+  resetAntigravitySessionChain,
   sanitizeText,
   type AntigravitySessionState,
 } from "../utils/util.js";
 import { antigravityFetch } from "../utils/http.js";
+import {
+  accountTokenExpired,
+  loadAccountsState,
+  resolveAccountEmail,
+  switchActiveAccount,
+} from "../auth/accounts.js";
+import { refreshAccount } from "../auth/oauth.js";
 
 export { ANTIGRAVITY_API };
 
@@ -345,7 +357,7 @@ export function convertMessages(
   }
 
   // Google Antigravity / Gemini requires the first turn to be from 'user'.
-  // If the conversation starts with 'model' (e.g. initial assistant greeting),
+  // If the conversation starts with 'model', as with an initial assistant greeting,
   // prepend a minimal user message to prevent backend 400 rejection.
   if (contents.length > 0 && contents[0]?.role === GeminiRole.Model) {
     contents.unshift({
@@ -357,18 +369,30 @@ export function convertMessages(
   return contents;
 }
 
+/** Object-shaped JSON Schema node. */
+type JsonSchemaObject = { [key: string]: JsonSchemaValue };
+
+/** Parse an unknown inbound value into an object-shaped Schema node (boundary op). */
+function asJsonSchemaObject(value: unknown): JsonSchemaObject {
+  const out: JsonSchemaObject = {};
+  if (isRecord(value)) {
+    for (const [key, entry] of Object.entries(value)) out[key] = asJsonSchemaValue(entry);
+  }
+  return out;
+}
+
 function dereferenceSchema(
   schema: unknown,
   rootDefs: Record<string, unknown> = {},
   visited = new Set<unknown>(),
-): unknown {
-  if (!schema || typeof schema !== "object") return schema;
+): JsonSchemaValue {
+  if (!schema || typeof schema !== "object") return asJsonSchemaValue(schema);
   if (Array.isArray(schema)) {
     return schema.map((item) => dereferenceSchema(item, rootDefs, visited));
   }
 
   const s = schema as Record<string, unknown>;
-  if (visited.has(s)) return s;
+  if (visited.has(s)) return asJsonSchemaValue(s);
   visited.add(s);
 
   const defs: Record<string, unknown> = { ...rootDefs };
@@ -383,13 +407,15 @@ function dereferenceSchema(
       if (isRecord(resolved)) {
         const { $ref: _, ...rest } = s;
         const restCleaned = dereferenceSchema(rest, defs, visited);
-        return isRecord(restCleaned) ? { ...resolved, ...restCleaned } : resolved;
+        return isRecord(restCleaned)
+          ? asJsonSchemaObject({ ...resolved, ...restCleaned })
+          : resolved;
       }
       return resolved;
     }
   }
 
-  const out: Record<string, unknown> = {};
+  const out: JsonSchemaObject = {};
   for (const [key, value] of Object.entries(s)) {
     out[key] = dereferenceSchema(value, defs, visited);
   }
@@ -406,8 +432,10 @@ function ensureRootObjectSchema(schema: unknown): Record<string, unknown> {
   return schema;
 }
 
-function stripMetaSchema(schema: unknown): unknown {
-  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return schema;
+function stripMetaSchema(schema: unknown): JsonSchemaValue {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return asJsonSchemaValue(schema);
+  }
   const omit = new Set([
     "$schema",
     "$id",
@@ -418,7 +446,7 @@ function stripMetaSchema(schema: unknown): unknown {
     "$defs",
     "definitions",
   ]);
-  const out: Record<string, unknown> = {};
+  const out: JsonSchemaObject = {};
   for (const [key, value] of Object.entries(schema)) {
     if (!omit.has(key)) out[key] = stripMetaSchema(value);
   }
@@ -427,8 +455,8 @@ function stripMetaSchema(schema: unknown): unknown {
 
 /**
  * Protobuf `Schema` fields accepted by Cloud Code Assist's Claude/GPT custom-tool
- * bridge (`parameters` field). Anything else — `nullable`, `anyOf`, `format`,
- * `$ref`, etc. — returns `Unknown name "..."` / Invalid JSON payload (400).
+ * bridge (`parameters` field). Anything else, such as `nullable`, `anyOf`,
+ * `format`, or `$ref`, returns `Unknown name "..."` / Invalid JSON payload (400).
  * Allowlist rather than denylist so new JSON Schema keywords cannot 400 the request.
  * Pi still validates tool args after the model calls them.
  */
@@ -441,22 +469,19 @@ const CUSTOM_TOOL_SCHEMA_ALLOW = new Set([
   "enum",
 ]);
 
-function normalizeCustomToolType(value: unknown): unknown {
+function normalizeCustomToolType(value: unknown): string | undefined {
   if (typeof value === "string") return value;
   if (!Array.isArray(value)) return undefined;
   // JSON Schema union types like ["string","null"] → first non-null scalar type.
   const entries = value as unknown[];
-  const scalar = entries.find(
-    (entry): entry is string => typeof entry === "string" && entry !== "null",
-  );
-  return scalar;
+  return entries.find((entry): entry is string => typeof entry === "string" && entry !== "null");
 }
 
-function normalizeCustomToolSchema(schema: unknown): unknown {
-  if (!schema || typeof schema !== "object") return schema;
+function normalizeCustomToolSchema(schema: unknown): JsonSchemaValue {
+  if (!schema || typeof schema !== "object") return asJsonSchemaValue(schema);
   if (Array.isArray(schema)) return schema.map(normalizeCustomToolSchema);
 
-  const out: Record<string, unknown> = {};
+  const out: JsonSchemaObject = {};
   for (const [key, value] of Object.entries(schema)) {
     if (!CUSTOM_TOOL_SCHEMA_ALLOW.has(key)) continue;
     if (key === "type") {
@@ -465,8 +490,8 @@ function normalizeCustomToolSchema(schema: unknown): unknown {
       continue;
     }
     if (key === "properties" && value && typeof value === "object" && !Array.isArray(value)) {
-      // Property names are user-defined, not Schema keywords — never allowlist-filter them.
-      const props: Record<string, unknown> = {};
+      // Property names are user-defined, not Schema keywords. Never allowlist-filter them.
+      const props: JsonSchemaObject = {};
       for (const [propName, propSchema] of Object.entries(value as Record<string, unknown>)) {
         props[propName] = normalizeCustomToolSchema(propSchema);
       }
@@ -620,7 +645,7 @@ function retiredNoticePrefixState(text: string): "possible" | "match" | "no-matc
 }
 
 /**
- * Google blocks an entire account — not one model — with 403 VALIDATION_REQUIRED until
+ * Google blocks an entire account, not one model, with 403 VALIDATION_REQUIRED until
  * the account owner completes identity/phone verification. Neither re-login nor a model
  * switch clears it, so the actionable `validation_url` in the error details has to reach
  * the user instead of the generic "re-login or try another model" advice.
@@ -1042,6 +1067,42 @@ export async function streamResponse(
   return hasContent;
 }
 
+/**
+ * When the active account exhausts plan quota (429 "Individual quota reached"),
+ * switch to the next saved account and make it active. Returns the switched
+ * account, or undefined when there is nothing to fail over to (single account, or
+ * none of the remaining accounts can be refreshed). `tried` accumulates the
+ * email of every account already attempted in this request, so one request
+ * cannot switch back to the same account.
+ */
+async function tryAccountFailover(
+  tried: Set<string>,
+  signal?: AbortSignal,
+): Promise<AntigravityAccount | undefined> {
+  try {
+    const state = loadAccountsState();
+    const candidates = state.accounts
+      .filter((account) => !tried.has(account.email))
+      .sort((a, b) => a.lastUsedAt - b.lastUsedAt);
+    for (const candidate of candidates) {
+      tried.add(candidate.email);
+      try {
+        // Expired session? Refresh now so the retry does not start with a 401.
+        const account = accountTokenExpired(candidate)
+          ? await refreshAccount(candidate, signal)
+          : candidate;
+        await switchActiveAccount(account.email);
+        return account;
+      } catch {
+        // The refresh token is revoked or expired. Try the next candidate.
+      }
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function streamAntigravity(
   model: Model<Api>,
   context: TranscriptContext,
@@ -1054,10 +1115,10 @@ export function streamAntigravity(
     const startTime = Date.now();
     const output = createOutput(model);
     try {
-      const creds = parseApiKey(opts.apiKey);
+      let creds = parseApiKey(opts.apiKey);
       // Skip loadCodeAssist roundtrip when credentials already carry a projectId.
       const warmedProject = creds.projectId ? null : await loadCodeAssist(creds.token);
-      const projectId = resolveProjectId({
+      let projectId = resolveProjectId({
         token: creds.token,
         warmedProject,
         credentialProjectId: creds.projectId,
@@ -1089,7 +1150,7 @@ export function streamAntigravity(
       }
 
       const isClaudeReasoning = model.id.startsWith("claude-") && model.reasoning;
-      const requestHeaders: Record<string, string> = {
+      let requestHeaders: Record<string, string> = {
         ...antigravityHeaders(creds.token),
         ...(isClaudeReasoning ? { "anthropic-beta": "interleaved-thinking-2025-05-14" } : {}),
       };
@@ -1098,6 +1159,11 @@ export function streamAntigravity(
       let lastText = "";
       let received = false;
       let runtimeModel = initialRuntimeModel;
+      // Plan-quota failover state: accounts attempted in this request cannot be
+      // retried.
+      const triedAccounts = new Set<string>();
+      let currentEmail = resolveAccountEmail(creds);
+      if (currentEmail) triedAccounts.add(currentEmail);
 
       for (let emptyAttempt = 0; emptyAttempt <= 2; emptyAttempt++) {
         if (opts.signal?.aborted) throw new Error("Request was aborted");
@@ -1213,6 +1279,39 @@ export function streamAntigravity(
           // retry it. Transient throttles keep the status + backend text so they stay
           // diagnosable and retryable.
           if (isPlanQuotaError(response?.status, lastText)) {
+            // Plan quota cannot clear before its reset time. Switch to another saved
+            // account (if any) and retry the whole request chain.
+            const fromEmail = creds.email || currentEmail;
+            const failoverAccount = await tryAccountFailover(triedAccounts, opts.signal);
+            if (failoverAccount) {
+              creds = {
+                token: failoverAccount.access,
+                projectId: failoverAccount.projectId,
+                email: failoverAccount.email || undefined,
+              };
+              currentEmail = failoverAccount.email;
+              const warmedFailover = creds.projectId ? null : await loadCodeAssist(creds.token);
+              projectId = resolveProjectId({
+                token: creds.token,
+                warmedProject: warmedFailover,
+                credentialProjectId: creds.projectId,
+              });
+              setLastProjectId(projectId);
+              requestHeaders = {
+                ...antigravityHeaders(creds.token),
+                ...(isClaudeReasoning
+                  ? { "anthropic-beta": "interleaved-thinking-2025-05-14" }
+                  : {}),
+              };
+              // The old agent/trajectory chain belongs to the previous account's project.
+              resetAntigravitySessionChain(sessionState);
+              setLastAccountFailover(fromEmail, failoverAccount.email);
+              response = undefined;
+              lastText = "";
+              // Re-enter the attempt loop under the new account (re-arm empty retries).
+              emptyAttempt = -1;
+              continue;
+            }
             throw new Error(friendly);
           }
           throw new Error(

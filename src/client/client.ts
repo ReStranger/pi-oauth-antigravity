@@ -64,7 +64,7 @@ export function endpointCandidates(preferredEndpoint?: string): string[] {
   return ENDPOINT_FALLBACKS;
 }
 
-// Cloud Code rejects newer models (e.g. Gemini 4 Argon) for clients below 2.23.0.
+// Cloud Code rejects newer models, such as Gemini 4 Argon, for clients below 2.23.0.
 const DEFAULT_ANTIGRAVITY_VERSION = "2.23.0";
 const DEFAULT_ANTIGRAVITY_CL = "963137146";
 
@@ -362,8 +362,8 @@ export async function fetchAvailableRuntimeModel(
   const cached = modelCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.result;
 
-  // De-dupe concurrent lookups for the same key (e.g. parallel requests right after
-  // startup) so they share one probe instead of each firing their own round-trips.
+  // De-dupe concurrent lookups for the same key, such as parallel requests right after
+  // startup, so they share one probe instead of each firing its own round-trip.
   const inFlight = inFlightModelLookups.get(cacheKey);
   if (inFlight) return inFlight;
 
@@ -435,7 +435,8 @@ export async function loadCodeAssist(token: string): Promise<string | undefined>
   const projectId = await loadCodeAssistUncached(token);
   projectCache.set(token, { projectId, expiresAt: Date.now() + PROJECT_CACHE_TTL_MS });
 
-  // Evict oldest entry when the cache exceeds 32 entries (O(1) — Map preserves insertion order).
+  // Evict the oldest entry when the cache exceeds 32 entries. Map preserves insertion
+  // order, so reading the first key is O(1).
   if (projectCache.size > 32) {
     const oldestKey = projectCache.keys().next().value;
     if (oldestKey !== undefined) projectCache.delete(oldestKey);

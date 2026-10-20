@@ -12,12 +12,21 @@ export type DiagnosticsSnapshot = {
   latencyMs?: number;
   maskedEmail?: string;
   tokenExpiry?: string;
+  /** Set when a 429 plan-quota triggered an automatic account switch mid-request. */
+  accountFailover?: { from?: string; to: string };
 };
 
 const storage = new AsyncLocalStorage<DiagnosticsSnapshot>();
 
 /** Last completed request snapshot for `/antigravity.doctor`. */
 let lastSnapshot: DiagnosticsSnapshot = {};
+
+/**
+ * Last account switch, kept outside the snapshot. Unrelated work that runs later
+ * (for example a pi-usage-core quota poll) commits its own empty bag and would
+ * otherwise erase the failover before the user runs `/antigravity.doctor`.
+ */
+let lastAccountFailover: DiagnosticsSnapshot["accountFailover"];
 
 function currentBag(): DiagnosticsSnapshot {
   return storage.getStore() ?? lastSnapshot;
@@ -80,6 +89,14 @@ export function setLastLatencyMs(ms: number | undefined): void {
 export function setLastMaskedEmail(email: string | undefined): void {
   currentBag().maskedEmail = email;
 }
+export function setLastAccountFailover(from: string | undefined, to: string): void {
+  const failover = { from, to };
+  lastAccountFailover = failover;
+  currentBag().accountFailover = failover;
+}
+export function getLastAccountFailover(): DiagnosticsSnapshot["accountFailover"] {
+  return lastAccountFailover;
+}
 export function setLastTokenExpiry(expiry: string | undefined): void {
   currentBag().tokenExpiry = expiry;
 }
@@ -87,4 +104,5 @@ export function setLastTokenExpiry(expiry: string | undefined): void {
 /** Test helper: reset last snapshot between cases. */
 export function resetDiagnosticsForTests(): void {
   lastSnapshot = {};
+  lastAccountFailover = undefined;
 }
