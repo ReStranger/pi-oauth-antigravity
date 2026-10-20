@@ -1,5 +1,7 @@
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { readStoredCredential } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
   antigravityHeaders,
   endpointCandidates,
@@ -7,7 +9,6 @@ import {
   parseApiKey,
   resolveProjectId,
 } from "../client/client.js";
-import { PROVIDER_ID } from "../models/models.js";
 import {
   setLastEndpoint,
   setLastError,
@@ -457,19 +458,19 @@ export async function resolveApiKeyFromContext(
   }
 
   try {
-    // `readStoredCredential` owns the auth.json path and parsing, so this fallback cannot
-    // drift from the host's credential format.
-    const stored = readStoredCredential(PROVIDER_ID) as
-      | { access?: unknown; projectId?: unknown; email?: unknown; expires?: unknown }
-      | undefined;
-    const access = typeof stored?.access === "string" ? stored.access : undefined;
-    const projectId = typeof stored?.projectId === "string" ? stored.projectId : undefined;
-    if (access && projectId) {
-      // A stored token without an expiry is still usable; only reject a known-expired one.
-      const expires = typeof stored?.expires === "number" ? stored.expires : undefined;
-      if (expires !== undefined && expires <= Date.now()) return undefined;
-      const email = typeof stored?.email === "string" ? stored.email : undefined;
-      return JSON.stringify({ token: access, projectId, ...(email ? { email } : {}) });
+    const authPath = join(getAgentDir(), "auth.json");
+    if (existsSync(authPath)) {
+      const data = JSON.parse(readFileSync(authPath, "utf-8")) as Record<string, unknown>;
+      const ag = data.antigravity as
+        | { access?: string; projectId?: string; email?: string }
+        | undefined;
+      if (ag && ag.access && ag.projectId) {
+        return JSON.stringify({
+          token: ag.access,
+          projectId: ag.projectId,
+          ...(ag.email ? { email: ag.email } : {}),
+        });
+      }
     }
   } catch {
     // Ignore fallback errors

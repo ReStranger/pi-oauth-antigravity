@@ -7,72 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-11-15
-
-### Added
-
-- **Gemini 4 Carbon** (`gemini-4-carbon-{low,medium,high}`, launched 2026-11-10) and
-  **Gemini 4 Hydrogen** (`gemini-4-hydrogen-{low,medium,high,xhigh}`, launched 2026-11-12 —
-  the backend's first `-xhigh` effort tier). Carbon/Hydrogen wire ids follow the family
-  pattern and are UNVERIFIED against a live listing; rejected requests fall back through
-  the Gemini 4 family (Hydrogen → Carbon → Argon → 3.8 Flash), with an xHigh tier
-  downgrade at each family boundary since only Hydrogen advertises `-xhigh`.
-- Fresh `x-cloudaicompanion-trace-id` / `X-Aicode-Request-Id` headers on every request.
-- **403 `TOS_VIOLATION` is recognized and surfaces account-risk advice** instead of the
-  generic "try another model, re-login" line. Google is actively enforcing third-party
-  OAuth use (the appeal copy names "third party software"); the reason lives in
-  `error.details`, which the old message path dropped, so a flagged account now gets told
-  that retries and re-login will not clear it and that further use risks suspension.
-- **Server `Retry-After` is honored on transient 429s** (seconds or HTTP-date form,
-  capped at 60s). A longer `Retry-After` is a cooldown that cannot clear inside the
-  retry loop (CPA issue #6646), so no attempts are burned on it and the backend's own
-  reset note is surfaced. Without the header the 2s/4s backoff is unchanged.
-- Claude Opus 5.5 / Sonnet 5.5 are documented as officially served (2026-11 models doc,
-  live discovery since 2026-10-03); the listed output/context figures remain same-family
-  estimates until Google publishes 5.5-specific numbers.
-
-### Added
-
-- **Gemini 4 Carbon** (`gemini-4-carbon-{low,medium,high}`, launched 2026-11-10) and
-  **Gemini 4 Hydrogen** (`gemini-4-hydrogen-{low,medium,high,xhigh}`, launched 2026-11-12 —
-  the backend's first `-xhigh` effort tier). Carbon/Hydrogen wire ids follow the family
-  pattern and are UNVERIFIED against a live listing; rejected requests fall back through
-  the Gemini 4 family (Hydrogen → Carbon → Argon → 3.8 Flash), with an xHigh tier
-  downgrade at each family boundary since only Hydrogen advertises `-xhigh`.
-- Fresh `x-cloudaicompanion-trace-id` / `X-Aicode-Request-Id` headers on every request.
-
 ### Changed
+- Replaced the `/antigravity.usage` command with native integration for [`pi-usage-core`](https://github.com/ReStranger/pi-usage-core). Antigravity quota pools (Gemini 5h/weekly, Claude+GPT 5h) and account details are now registered automatically into Pi's unified `/usage` dashboard and persistent footer status line via `pi.events` and `globalThis.__PI_USAGE__`.
+- Updated `/antigravity.doctor` diagnostics to reflect available commands (`/antigravity.models`, `/antigravity.doctor`, `/antigravity.image`).
 
-- **`claude-opus-4-6-thinking`, `claude-sonnet-4-6` and `gpt-oss-120b-medium` leave the
-  selectable catalog** — Google removes them on 2026-11-18. Pinned overrides to their wire
-  ids still resolve (routing + output-token entries retained), and the retirement-notice
-  detector now covers their plain-text notices instead of rendering them as assistant text;
-  the surfaced error names retirement generically and points at `/antigravity.models`.
-- **Request identity tracks the shipping client** (`antigravity/hub/2.32.1`, was 2.23.0).
-  A stale identity silently receives a REDUCED model catalog from discovery, without an
-  error (codex2api e3d59f9; oh-my-pi pinned 2.32.1 on 2026-11-14 for the same reason).
-- Gemini 4 Argon is no longer provisional: launched 2026-10-13, wire ids verified against
-  live `fetchAvailableModels` (opencodex 2026-10-14, codex2api 2026-10-16). Catalog table
-  and README reflect the 2026-11 models doc; README carries a ToS-risk warning for
-  third-party OAuth use.
-
-## [0.1.9] - 2026-10-26
-
-### Added
-- Optional [`pi-usage-core`](https://github.com/ReStranger/pi-usage-core) integration. When that extension is loaded, Antigravity quota pools (Gemini 5h/weekly, Claude+GPT) and account details are also registered into its unified `/usage` dashboard and persistent footer status line. `pi-usage-core` is not a runtime dependency: with or without it, this package works on its own.
-- `/antigravity.doctor` now reports which usage mode is active on a `usageCore=` line.
-
-### Changed
-- `/antigravity.usage` remains available as a standalone command and now appends a one-line tip when `pi-usage-core` is installed, instead of being replaced by the integration.
-
-### Fixed
-- A background quota poll no longer overwrites the diagnostics `/antigravity.doctor` reports. Quota reads run in a detached bag, so a failed usage fetch (e.g. free-tier `SUBSCRIPTION_REQUIRED`) is no longer shown as the last model request's error.
-- A quota group whose buckets were all filtered out no longer produced a `ready` account with an empty pool, and no longer suppressed the per-model quota fallback.
-- Bucket periods are mapped from the reported window instead of collapsing every non-5h bucket to `weekly`, so daily and monthly quotas are no longer mislabelled in the footer's multi-window format.
-- Free-tier quota synthesized from the model catalog is labelled `total` instead of claiming a 5h session the backend never reported.
-- Groups sharing a model family no longer produce duplicate pool ids.
-- The account email is masked before it is displayed in a usage dashboard.
-- The `auth.json` credential fallback now uses the host's `readStoredCredential`, and a stored token without an expiry is usable instead of being silently ignored.
 
 ## [0.1.8] - 2026-10-15
 

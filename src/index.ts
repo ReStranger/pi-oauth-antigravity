@@ -13,7 +13,7 @@ import { StringEnum, Type } from "@earendil-works/pi-ai";
 import { registerApiProvider } from "@earendil-works/pi-ai/compat";
 import { getApiKey, loginAntigravity, refreshAntigravityToken } from "./auth/index.js";
 import { DEFAULT_ENDPOINT, endpointCandidates } from "./client/index.js";
-import { getLastDiagnostics, runWithDetachedDiagnostics } from "./diagnostics/index.js";
+import { getLastDiagnostics, runWithDiagnostics } from "./diagnostics/index.js";
 import {
   DEFAULT_IMAGE_MODEL,
   generateAntigravityImage,
@@ -25,8 +25,6 @@ import { ANTIGRAVITY_API, streamAntigravity } from "./stream/index.js";
 import {
   fetchAccountUsage,
   formatModelsList,
-  formatUsageSummary,
-  isUsageCoreAvailable,
   registerAntigravityUsageAdapter,
   resolveApiKeyFromContext,
 } from "./usage/index.js";
@@ -64,9 +62,7 @@ async function withUsage(
       return;
     }
     if (ctx.hasUI) ctx.ui.notify("Fetching Antigravity usage…", "info");
-    // Detached: /antigravity.usage and /antigravity.models read quota state, they are not model
-    // requests. Committing their poll would make doctor report a quota-RPC error as lastError.
-    const usage = await runWithDetachedDiagnostics(() => fetchAccountUsage(apiKey));
+    const usage = await runWithDiagnostics(() => fetchAccountUsage(apiKey));
     emitCommandOutput(ctx, fn(usage));
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
@@ -102,20 +98,6 @@ export default function (pi: ExtensionAPI): void {
 
   registerAntigravityUsageAdapter(pi);
 
-  pi.registerCommand("antigravity.usage", {
-    description: "Show Antigravity shared quota pools (Gemini / Claude+GPT, 5h + weekly)",
-    handler: async (_args, ctx) => {
-      // Keep this command working on its own: `pi-usage-core` is an optional third-party
-      // extension, so a user who has not installed it has no other way to read quotas.
-      await withUsage(ctx, (usage) => {
-        const summary = formatUsageSummary(usage);
-        return isUsageCoreAvailable()
-          ? `${summary}\n\nTip: pi-usage-core is installed — /usage shows these pools in the unified dashboard.`
-          : summary;
-      });
-    },
-  });
-
   pi.registerCommand("antigravity.models", {
     description: "List Antigravity runtime models + remaining pool fraction",
     handler: async (args, ctx) => {
@@ -140,8 +122,7 @@ export default function (pi: ExtensionAPI): void {
         `lastError=${d.error ? redactSecrets(d.error) : "none"}`,
         "transport=native-streamSimple",
         "runtimeCli=not-used",
-        `usageCore=${isUsageCoreAvailable() ? "registered" : "not-installed (install pi-usage-core for /usage)"}`,
-        "commands=/antigravity.usage /antigravity.models /antigravity.doctor /antigravity.image",
+        "commands=/antigravity.models /antigravity.doctor /antigravity.image",
       ];
       emitCommandOutput(ctx, `Antigravity doctor\n${lines.join("\n")}`);
     },

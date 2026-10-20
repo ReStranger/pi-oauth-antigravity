@@ -14,8 +14,7 @@ Google Antigravity OAuth provider extension for [Pi](https://pi.dev). Connects P
   - Cross-restart session state persistence (`.pi/agent/cache/antigravity-sessions.json`) to maintain cluster affinity across quick Pi restarts.
 - **Image Generation**: Built-in `generate_image` tool and `/antigravity.image` command powered by Google's image models with aspect-ratio selection and safe directory containment.
 - **Diagnostic & Usage Tools**:
-  - `/antigravity.usage` — shared quota pools (Gemini 5h/weekly, Claude+GPT 5h) with plan tier and reset countdowns.
-  - Optional unified dashboard: install [`pi-usage-core`](https://github.com/ReStranger/pi-usage-core) and the same pools also appear in the shared `/usage` dashboard and footer status line.
+  - Seamless integration with [`pi-usage-core`](https://github.com/ReStranger/pi-usage-core) — registers Antigravity quota pools (Gemini 5h/weekly, Claude+GPT 5h) into the unified `/usage` dashboard and footer status line.
   - `/antigravity.models` — backend discovery of available Cloud Code Assist models and remaining pool fractions.
   - `/antigravity.doctor` — connection check, token expiry inspection, and diagnostic dump.
 
@@ -23,48 +22,25 @@ Google Antigravity OAuth provider extension for [Pi](https://pi.dev). Connects P
 
 | Public Model ID | Backend Wire ID | Max Output | Context Window |
 | :--- | :--- | :--- | :--- |
-| `antigravity/gemini-4-hydrogen` | `gemini-4-hydrogen-{low,medium,high,xhigh}`† | 65,536† | 1,048,576† |
-| `antigravity/gemini-4-carbon` | `gemini-4-carbon-{low,medium,high}`† | 65,536† | 1,048,576† |
-| `antigravity/gemini-4-argon` | `gemini-4-argon-{low,medium,high}` | 65,536† | 1,048,576† |
+| `antigravity/gemini-4-argon` | `gemini-4-argon-{low,medium,high}`† | 65,536† | 1,048,576† |
 | `antigravity/gemini-3.8-flash` | `gemini-3.8-flash-{low,medium,high}` | 65,536 | 1,048,576 |
 | `antigravity/gemini-3.7-flash` | `gemini-3.7-flash-{low,medium,high}` | 65,536 | 1,048,576 |
 | `antigravity/gemini-3.7-flash-thinking` | `gemini-3.7-flash-thinking` | 65,536 | 1,048,576 |
 | `antigravity/gemini-3.6-flash` | `gemini-3.6-flash-{low,medium,high}` | 65,536 | 1,048,576 |
 | `antigravity/gemini-3.1-pro` | `gemini-3.1-pro` | 65,536 | 1,048,576 |
+| `antigravity/claude-opus-4-6` | `claude-opus-4-6` | 64,000 | 200,000 |
 | `antigravity/claude-opus-5-5-low` | `claude-opus-5-5-low` | 64,000* | 250,000* |
 | `antigravity/claude-opus-5-5-medium` | `claude-opus-5-5-medium` | 64,000* | 250,000* |
 | `antigravity/claude-opus-5-5-high` | `claude-opus-5-5-high` | 64,000* | 250,000* |
+| `antigravity/claude-sonnet-4-6` | `claude-sonnet-4-6` | 64,000 | 200,000 |
 | `antigravity/claude-sonnet-5-5-low` | `claude-sonnet-5-5-low` | 64,000* | 200,000* |
 | `antigravity/claude-sonnet-5-5-medium` | `claude-sonnet-5-5-medium` | 64,000* | 200,000* |
 | `antigravity/claude-sonnet-5-5-high` | `claude-sonnet-5-5-high` | 64,000* | 200,000* |
+| `antigravity/gpt-oss-120b` | `gpt-oss-120b` | 8,192 | 131,072 |
 
-Hydrogen (2026-11-12) is the first model with an `-xhigh` effort tier; Carbon (2026-11-10)
-and Argon (2026-10-13) top out at High. Argon/Carbon/Hydrogen are entitlement-gated
-(Ultra / Enterprise / paid Pro); a rejected request falls back through the Gemini 4
-family to Gemini 3.8 Flash.
+† Inferred from runtime ids referenced by Antigravity IDE 2.23.0, not yet confirmed against a live model listing; limits and pricing are provisional, and requests fall back to Gemini 3.8 Flash if the backend rejects the model.
 
-`claude-opus-4-6-thinking`, `claude-sonnet-4-6` and `gpt-oss-120b-medium` were removed by
-Google on **2026-11-18** and are no longer selectable; pinned overrides to their wire ids
-still resolve until the backend drops them, and their retirement notices are detected and
-surfaced as errors instead of assistant text.
-
-### Third-party OAuth is a ToS risk
-
-Google's enforcement against third-party Antigravity OAuth clients is active: appeal forms
-name "using third party software to access Antigravity", and 403 `PERMISSION_DENIED /
-TOS_VIOLATION` reports against third-party clients exist (oh-my-pi paused its provider on
-2026-11-14 for this reason). Using this extension may put your Google account at risk —
-prefer the official Antigravity IDE/CLI when possible, and don't say you weren't warned.
-
-† Gemini 4 family: Argon wire ids verified against live discovery (2026-10-14); Carbon/Hydrogen wire ids follow the family pattern but are UNVERIFIED against a live listing. Limits and pricing are same-family estimates; a rejected request falls back to the previous Gemini 4 model, then Gemini 3.8 Flash.
-
-\* Claude Opus 5.5 / Sonnet 5.5 are officially served (2026-11 models doc, live discovery
-since 2026-10-03); the listed output/context figures stay same-family estimates until
-Google publishes 5.5-specific numbers.
-
-The request identity tracks the shipping client (`antigravity/hub/2.32.1`) and every call
-sends fresh `x-cloudaicompanion-trace-id` / `X-Aicode-Request-Id` headers — a stale client
-identity silently receives a REDUCED model catalog from discovery, without an error.
+\* Provisional same-family estimates only; Claude 5.5 backend output/context limits have not been verified.
 
 ## Installation
 
@@ -95,12 +71,11 @@ pi -e /path/to/pi-oauth-antigravity/dist/index.js
 
 ## Slash Commands
 
-- `/antigravity.usage` — View shared quota pools (Gemini 5h/weekly, Claude+GPT 5h), plan tier, and reset countdowns.
 - `/antigravity.models` — List dynamically fetched and statically registered models + remaining pool fraction.
 - `/antigravity.doctor` — Diagnose OAuth state, refresh token health, and endpoint connectivity.
 - `/antigravity.image <prompt> [--aspect 1:1|16:9|...]` — Generate images directly to your project.
 
-> **Optional: unified `/usage` dashboard.** This extension always works standalone. If you also install [`pi-usage-core`](https://github.com/ReStranger/pi-usage-core) (`pi install npm:pi-usage-core`), the Antigravity pools are additionally registered into its interactive `/usage` dashboard and persistent footer status line. `/antigravity.doctor` reports which mode is active on the `usageCore=` line.
+> **Quota & Usage Tracking**: Quota tracking is now powered by [`pi-usage-core`](https://github.com/ReStranger/pi-usage-core). Install `pi-usage-core` to view Antigravity pools in the interactive `/usage` dashboard and persistent footer status line.
 
 ## Development
 
@@ -108,7 +83,7 @@ pi -e /path/to/pi-oauth-antigravity/dist/index.js
 # Install dependencies
 npm install
 
-# Run unit tests (84 tests)
+# Run unit tests (50 tests)
 npm test
 
 # Typecheck
