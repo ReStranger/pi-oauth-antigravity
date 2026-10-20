@@ -462,9 +462,12 @@ export async function resolveApiKeyFromContext(
     if (existsSync(authPath)) {
       const data = JSON.parse(readFileSync(authPath, "utf-8")) as Record<string, unknown>;
       const ag = data.antigravity as
-        | { access?: string; projectId?: string; email?: string }
+        | { access?: string; projectId?: string; email?: string; expires?: number }
         | undefined;
-      if (ag && ag.access && ag.projectId) {
+      if (ag?.access && ag.projectId) {
+        if (Number.isFinite(ag.expires) && (ag.expires as number) <= Date.now()) {
+          return undefined;
+        }
         return JSON.stringify({
           token: ag.access,
           projectId: ag.projectId,
