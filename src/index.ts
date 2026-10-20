@@ -25,7 +25,7 @@ import { ANTIGRAVITY_API, streamAntigravity } from "./stream/index.js";
 import {
   fetchAccountUsage,
   formatModelsList,
-  formatUsageSummary,
+  registerAntigravityUsageAdapter,
   resolveApiKeyFromContext,
 } from "./usage/index.js";
 import { prewarmConnection, redactSecrets } from "./utils/index.js";
@@ -96,12 +96,7 @@ export default function (pi: ExtensionAPI): void {
     streamSimple: streamAntigravity,
   });
 
-  pi.registerCommand("antigravity.usage", {
-    description: "Show Antigravity shared quota pools (Gemini / Claude+GPT, 5h + weekly)",
-    handler: async (_args, ctx) => {
-      await withUsage(ctx, formatUsageSummary);
-    },
-  });
+  registerAntigravityUsageAdapter(pi);
 
   pi.registerCommand("antigravity.models", {
     description: "List Antigravity runtime models + remaining pool fraction",
@@ -127,7 +122,7 @@ export default function (pi: ExtensionAPI): void {
         `lastError=${d.error ? redactSecrets(d.error) : "none"}`,
         "transport=native-streamSimple",
         "runtimeCli=not-used",
-        "commands=/antigravity.usage /antigravity.models /antigravity.doctor /antigravity.image",
+        "commands=/antigravity.models /antigravity.doctor /antigravity.image",
       ];
       emitCommandOutput(ctx, `Antigravity doctor\n${lines.join("\n")}`);
     },

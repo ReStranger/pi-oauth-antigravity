@@ -14,8 +14,8 @@ Google Antigravity OAuth provider extension for [Pi](https://pi.dev). Connects P
   - Cross-restart session state persistence (`.pi/agent/cache/antigravity-sessions.json`) to maintain cluster affinity across quick Pi restarts.
 - **Image Generation**: Built-in `generate_image` tool and `/antigravity.image` command powered by Google's image models with aspect-ratio selection and safe directory containment.
 - **Diagnostic & Usage Tools**:
-  - `/antigravity.usage` — token counts, cache read efficiency, and session metrics.
-  - `/antigravity.models` — backend discovery of available Cloud Code Assist models.
+  - Seamless integration with [`pi-usage-core`](https://github.com/ReStranger/pi-usage-core) — registers Antigravity quota pools (Gemini 5h/weekly, Claude+GPT 5h) into the unified `/usage` dashboard and footer status line.
+  - `/antigravity.models` — backend discovery of available Cloud Code Assist models and remaining pool fractions.
   - `/antigravity.doctor` — connection check, token expiry inspection, and diagnostic dump.
 
 ## Supported Models
@@ -71,10 +71,11 @@ pi -e /path/to/pi-oauth-antigravity/dist/index.js
 
 ## Slash Commands
 
-- `/antigravity.usage` — View current session usage, cached token statistics, and cost estimates.
-- `/antigravity.models` — List dynamically fetched and statically registered models.
+- `/antigravity.models` — List dynamically fetched and statically registered models + remaining pool fraction.
 - `/antigravity.doctor` — Diagnose OAuth state, refresh token health, and endpoint connectivity.
 - `/antigravity.image <prompt> [--aspect 1:1|16:9|...]` — Generate images directly to your project.
+
+> **Quota & Usage Tracking**: Quota tracking is now powered by [`pi-usage-core`](https://github.com/ReStranger/pi-usage-core). Install `pi-usage-core` to view Antigravity pools in the interactive `/usage` dashboard and persistent footer status line.
 
 ## Development
 
