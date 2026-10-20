@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -8,6 +8,7 @@ import {
   createAntigravityUsageAdapter,
   registerAntigravityUsageAdapter,
 } from "../src/usage/adapter.js";
+import { resolveApiKeyFromContext } from "../src/usage/usage.js";
 import type { AccountUsage } from "../src/types/types.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -179,6 +180,60 @@ test("createAntigravityUsageAdapter returns auth-required when no credentials ex
     assert.equal(accounts.length, 1);
     assert.equal(accounts[0]?.status, "auth-required");
     assert.match(accounts[0]?.errorMessage ?? "", /Run \/login antigravity/);
+  } finally {
+    if (prevEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevEnv;
+    rmSync(tmpAgentDir, { recursive: true, force: true });
+  }
+});
+
+test("resolveApiKeyFromContext rejects expired tokens from auth.json", async () => {
+  const tmpAgentDir = mkdtempSync(join(tmpdir(), "pi-usage-test-"));
+  const prevEnv = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = tmpAgentDir;
+  try {
+    const mockCtx = {
+      modelRegistry: {
+        getApiKeyForProvider: async () => undefined,
+      },
+    } as unknown as ExtensionContext;
+
+    // 1. Expired token in auth.json
+    writeFileSync(
+      join(tmpAgentDir, "auth.json"),
+      JSON.stringify({
+        antigravity: {
+          access: "expired-token",
+          projectId: "test-proj",
+          expires: Date.now() - 60000,
+        },
+      }),
+      "utf-8",
+    );
+
+    const expiredKey = await resolveApiKeyFromContext(mockCtx);
+    assert.equal(expiredKey, undefined);
+
+    // 2. Valid (unexpired) token in auth.json
+    writeFileSync(
+      join(tmpAgentDir, "auth.json"),
+      JSON.stringify({
+        antigravity: {
+          access: "valid-token",
+          projectId: "test-proj",
+          expires: Date.now() + 3600000,
+          email: "valid@example.com",
+        },
+      }),
+      "utf-8",
+    );
+
+    const validKey = await resolveApiKeyFromContext(mockCtx);
+    assert.ok(validKey);
+    const parsed = JSON.parse(validKey as string);
+    assert.equal(parsed.token, "valid-token");
+    assert.equal(parsed.projectId, "test-proj");
+    assert.equal(parsed.email, "valid@example.com");
   } finally {
     if (prevEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = prevEnv;
