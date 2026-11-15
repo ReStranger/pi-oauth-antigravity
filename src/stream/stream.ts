@@ -11,9 +11,11 @@ import {
   type ToolCall,
 } from "@earendil-works/pi-ai";
 import {
+  asJsonSchemaValue,
   getJsonSchemaToolParameters,
   requiresToolCallId,
   resolveJsonSchemaStrictSampling,
+  type JsonSchemaValue,
 } from "./provider-helpers.js";
 import { getCurrentSystemPrompt, getCurrentTools } from "./transcript.js";
 import {
@@ -30,6 +32,7 @@ import {
 import {
   getCurrentEndpoint,
   runWithDiagnostics,
+  setLastAccountFailover,
   setLastEndpoint,
   setLastError,
   setLastLatencyMs,
@@ -57,6 +60,7 @@ import { redactSecrets, safeError } from "../utils/security.js";
 import {
   ANTIGRAVITY_API,
   type ActiveBlock,
+  type AntigravityAccount,
   type AntigravityGenerateRequest,
   type AntigravityStreamOptions,
   type ContentBlock,
@@ -78,10 +82,18 @@ import {
   getOrCreateAntigravitySession,
   isRecord,
   persistAntigravitySessions,
+  resetAntigravitySessionChain,
   sanitizeText,
   type AntigravitySessionState,
 } from "../utils/util.js";
 import { antigravityFetch } from "../utils/http.js";
+import {
+  accountTokenExpired,
+  loadAccountsState,
+  resolveAccountEmail,
+  switchActiveAccount,
+} from "../auth/accounts.js";
+import { refreshAccount } from "../auth/oauth.js";
 
 export { ANTIGRAVITY_API };
 
@@ -131,27 +143,6 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 /** Plan quota is deterministic; everything else on a 429 is a transient throttle. */
 export function isPlanQuotaError(status: number | undefined, text: string): boolean {
   return status === 429 && /Individual quota reached/i.test(text);
-}
-
-/**
- * Transient 429s may carry a server-provided Retry-After (seconds or HTTP-date, CPA
- * issue #6646). Trust it over the local backoff when it is short enough to be worth a
- * retry; a longer value is a cooldown that will not clear inside this loop.
- */
-export const THROTTLE_RETRY_AFTER_CAP_SECONDS = 60;
-
-export function parseRetryAfterSeconds(raw: string | null | undefined): number | undefined {
-  if (!raw) return undefined;
-  const trimmed = raw.trim();
-  if (!trimmed) return undefined;
-  if (/^\d+$/.test(trimmed)) {
-    const seconds = Number(trimmed);
-    return Number.isFinite(seconds) && seconds >= 0 ? seconds : undefined;
-  }
-  const date = Date.parse(trimmed);
-  if (Number.isNaN(date)) return undefined;
-  const seconds = Math.round((date - Date.now()) / 1000);
-  return seconds >= 0 ? seconds : 0;
 }
 
 /**
@@ -366,7 +357,7 @@ export function convertMessages(
   }
 
   // Google Antigravity / Gemini requires the first turn to be from 'user'.
-  // If the conversation starts with 'model' (e.g. initial assistant greeting),
+  // If the conversation starts with 'model', as with an initial assistant greeting,
   // prepend a minimal user message to prevent backend 400 rejection.
   if (contents.length > 0 && contents[0]?.role === GeminiRole.Model) {
     contents.unshift({
@@ -378,18 +369,30 @@ export function convertMessages(
   return contents;
 }
 
+/** Object-shaped JSON Schema node. */
+type JsonSchemaObject = { [key: string]: JsonSchemaValue };
+
+/** Parse an unknown inbound value into an object-shaped Schema node (boundary op). */
+function asJsonSchemaObject(value: unknown): JsonSchemaObject {
+  const out: JsonSchemaObject = {};
+  if (isRecord(value)) {
+    for (const [key, entry] of Object.entries(value)) out[key] = asJsonSchemaValue(entry);
+  }
+  return out;
+}
+
 function dereferenceSchema(
   schema: unknown,
   rootDefs: Record<string, unknown> = {},
   visited = new Set<unknown>(),
-): unknown {
-  if (!schema || typeof schema !== "object") return schema;
+): JsonSchemaValue {
+  if (!schema || typeof schema !== "object") return asJsonSchemaValue(schema);
   if (Array.isArray(schema)) {
     return schema.map((item) => dereferenceSchema(item, rootDefs, visited));
   }
 
   const s = schema as Record<string, unknown>;
-  if (visited.has(s)) return s;
+  if (visited.has(s)) return asJsonSchemaValue(s);
   visited.add(s);
 
   const defs: Record<string, unknown> = { ...rootDefs };
@@ -404,13 +407,15 @@ function dereferenceSchema(
       if (isRecord(resolved)) {
         const { $ref: _, ...rest } = s;
         const restCleaned = dereferenceSchema(rest, defs, visited);
-        return isRecord(restCleaned) ? { ...resolved, ...restCleaned } : resolved;
+        return isRecord(restCleaned)
+          ? asJsonSchemaObject({ ...resolved, ...restCleaned })
+          : resolved;
       }
       return resolved;
     }
   }
 
-  const out: Record<string, unknown> = {};
+  const out: JsonSchemaObject = {};
   for (const [key, value] of Object.entries(s)) {
     out[key] = dereferenceSchema(value, defs, visited);
   }
@@ -427,8 +432,10 @@ function ensureRootObjectSchema(schema: unknown): Record<string, unknown> {
   return schema;
 }
 
-function stripMetaSchema(schema: unknown): unknown {
-  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return schema;
+function stripMetaSchema(schema: unknown): JsonSchemaValue {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return asJsonSchemaValue(schema);
+  }
   const omit = new Set([
     "$schema",
     "$id",
@@ -439,7 +446,7 @@ function stripMetaSchema(schema: unknown): unknown {
     "$defs",
     "definitions",
   ]);
-  const out: Record<string, unknown> = {};
+  const out: JsonSchemaObject = {};
   for (const [key, value] of Object.entries(schema)) {
     if (!omit.has(key)) out[key] = stripMetaSchema(value);
   }
@@ -448,8 +455,8 @@ function stripMetaSchema(schema: unknown): unknown {
 
 /**
  * Protobuf `Schema` fields accepted by Cloud Code Assist's Claude/GPT custom-tool
- * bridge (`parameters` field). Anything else — `nullable`, `anyOf`, `format`,
- * `$ref`, etc. — returns `Unknown name "..."` / Invalid JSON payload (400).
+ * bridge (`parameters` field). Anything else, such as `nullable`, `anyOf`,
+ * `format`, or `$ref`, returns `Unknown name "..."` / Invalid JSON payload (400).
  * Allowlist rather than denylist so new JSON Schema keywords cannot 400 the request.
  * Pi still validates tool args after the model calls them.
  */
@@ -462,22 +469,19 @@ const CUSTOM_TOOL_SCHEMA_ALLOW = new Set([
   "enum",
 ]);
 
-function normalizeCustomToolType(value: unknown): unknown {
+function normalizeCustomToolType(value: unknown): string | undefined {
   if (typeof value === "string") return value;
   if (!Array.isArray(value)) return undefined;
   // JSON Schema union types like ["string","null"] → first non-null scalar type.
   const entries = value as unknown[];
-  const scalar = entries.find(
-    (entry): entry is string => typeof entry === "string" && entry !== "null",
-  );
-  return scalar;
+  return entries.find((entry): entry is string => typeof entry === "string" && entry !== "null");
 }
 
-function normalizeCustomToolSchema(schema: unknown): unknown {
-  if (!schema || typeof schema !== "object") return schema;
+function normalizeCustomToolSchema(schema: unknown): JsonSchemaValue {
+  if (!schema || typeof schema !== "object") return asJsonSchemaValue(schema);
   if (Array.isArray(schema)) return schema.map(normalizeCustomToolSchema);
 
-  const out: Record<string, unknown> = {};
+  const out: JsonSchemaObject = {};
   for (const [key, value] of Object.entries(schema)) {
     if (!CUSTOM_TOOL_SCHEMA_ALLOW.has(key)) continue;
     if (key === "type") {
@@ -486,8 +490,8 @@ function normalizeCustomToolSchema(schema: unknown): unknown {
       continue;
     }
     if (key === "properties" && value && typeof value === "object" && !Array.isArray(value)) {
-      // Property names are user-defined, not Schema keywords — never allowlist-filter them.
-      const props: Record<string, unknown> = {};
+      // Property names are user-defined, not Schema keywords. Never allowlist-filter them.
+      const props: JsonSchemaObject = {};
       for (const [propName, propSchema] of Object.entries(value as Record<string, unknown>)) {
         props[propName] = normalizeCustomToolSchema(propSchema);
       }
@@ -626,37 +630,22 @@ export function mapStopReason(reason: string | undefined): StopReason {
   return reason ? StopReason.Error : StopReason.Stop;
 }
 
-/**
- * Backends answer retired models with a plain text notice instead of an error. The 3.5
- * wording is the observed template; the 2026-11-18 removals (Claude 4.6, Sonnet 4.6,
- * GPT-OSS 120B) are expected to reuse it. Match on the model name prefix, not the full
- * sentence, so wording drift on the suffix stays harmless.
- */
-const RETIRED_NOTICE_PREFIXES = [
-  "gemini 3.5 flash is no longer available. please switch to",
-  "claude-opus-4-6 is no longer available",
-  "claude-sonnet-4-6 is no longer available",
-  "gpt-oss-120b is no longer available",
-];
+const RETIRED_GEMINI_35_NOTICE_PREFIX =
+  "gemini 3.5 flash is no longer available. please switch to";
 
-const RETIRED_RUNTIME_PATTERN =
-  /^(?:gemini-3\.5-flash(?:-|$)|gemini-3-flash-agent$|claude-opus-4-6|claude-sonnet-4-6|gpt-oss-120b)/i;
-
-function isRetiredRuntime(runtimeModel: string): boolean {
-  return RETIRED_RUNTIME_PATTERN.test(runtimeModel);
+function isRetiredGemini35Runtime(runtimeModel: string): boolean {
+  return /^(?:gemini-3\.5-flash(?:-|$)|gemini-3-flash-agent$)/i.test(runtimeModel);
 }
 
 function retiredNoticePrefixState(text: string): "possible" | "match" | "no-match" {
   const normalized = text.trimStart().replace(/\s+/g, " ").toLowerCase();
-  for (const prefix of RETIRED_NOTICE_PREFIXES) {
-    if (normalized.startsWith(prefix)) return "match";
-    if (prefix.startsWith(normalized) && normalized.length > 0) return "possible";
-  }
+  if (normalized.startsWith(RETIRED_GEMINI_35_NOTICE_PREFIX)) return "match";
+  if (RETIRED_GEMINI_35_NOTICE_PREFIX.startsWith(normalized)) return "possible";
   return "no-match";
 }
 
 /**
- * Google blocks an entire account — not one model — with 403 VALIDATION_REQUIRED until
+ * Google blocks an entire account, not one model, with 403 VALIDATION_REQUIRED until
  * the account owner completes identity/phone verification. Neither re-login nor a model
  * switch clears it, so the actionable `validation_url` in the error details has to reach
  * the user instead of the generic "re-login or try another model" advice.
@@ -757,18 +746,6 @@ export function friendlyAntigravityError(status: number | undefined, text: strin
     // Fallback for gateways that strip `details` but keep the message.
     if (/verify your account|VALIDATION_REQUIRED/i.test(msg)) {
       return formatAccountValidation({ message: msg });
-    }
-    // Google is actively enforcing third-party OAuth use (403 PERMISSION_DENIED,
-    // reason TOS_VIOLATION; the appeal copy names "third party software"). The reason
-    // lives in error.details, which jsonOrTextError drops — match the raw body. Retries,
-    // re-login and model switches do not clear it, and the account itself is at risk.
-    if (/TOS_VIOLATION|third[- ]party (software|tools|services|clients?)/i.test(text)) {
-      return (
-        "Antigravity flagged this account for third-party access (TOS_VIOLATION). " +
-        "Retries and re-login will not clear it; further use may get the account suspended. " +
-        "Next: stop using third-party clients on this account and appeal through Google support. " +
-        `Backend said: ${msg}`
-      );
     }
     if (/permission|forbidden|access/i.test(msg)) {
       return "Antigravity access was denied for this account or project. Next: try another model, re-login, or use an account with access.";
@@ -999,8 +976,8 @@ export async function streamResponse(
               }
               reader.releaseLock();
               throw new Error(
-                "Antigravity reports that this model has been retired and is no longer available. " +
-                  "Next: switch to a current catalog model (see /antigravity.models).",
+                "Antigravity reports that Gemini 3.5 Flash is no longer available. " +
+                  "Next: switch to gemini-3.8-flash, gemini-3.7-flash, or another catalog model.",
               );
             }
             if (noticeState !== "possible") flushPendingRetiredNoticeParts();
@@ -1090,6 +1067,42 @@ export async function streamResponse(
   return hasContent;
 }
 
+/**
+ * When the active account exhausts plan quota (429 "Individual quota reached"),
+ * switch to the next saved account and make it active. Returns the switched
+ * account, or undefined when there is nothing to fail over to (single account, or
+ * none of the remaining accounts can be refreshed). `tried` accumulates the
+ * email of every account already attempted in this request, so one request
+ * cannot switch back to the same account.
+ */
+async function tryAccountFailover(
+  tried: Set<string>,
+  signal?: AbortSignal,
+): Promise<AntigravityAccount | undefined> {
+  try {
+    const state = loadAccountsState();
+    const candidates = state.accounts
+      .filter((account) => !tried.has(account.email))
+      .sort((a, b) => a.lastUsedAt - b.lastUsedAt);
+    for (const candidate of candidates) {
+      tried.add(candidate.email);
+      try {
+        // Expired session? Refresh now so the retry does not start with a 401.
+        const account = accountTokenExpired(candidate)
+          ? await refreshAccount(candidate, signal)
+          : candidate;
+        await switchActiveAccount(account.email);
+        return account;
+      } catch {
+        // The refresh token is revoked or expired. Try the next candidate.
+      }
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function streamAntigravity(
   model: Model<Api>,
   context: TranscriptContext,
@@ -1102,10 +1115,10 @@ export function streamAntigravity(
     const startTime = Date.now();
     const output = createOutput(model);
     try {
-      const creds = parseApiKey(opts.apiKey);
+      let creds = parseApiKey(opts.apiKey);
       // Skip loadCodeAssist roundtrip when credentials already carry a projectId.
       const warmedProject = creds.projectId ? null : await loadCodeAssist(creds.token);
-      const projectId = resolveProjectId({
+      let projectId = resolveProjectId({
         token: creds.token,
         warmedProject,
         credentialProjectId: creds.projectId,
@@ -1137,7 +1150,7 @@ export function streamAntigravity(
       }
 
       const isClaudeReasoning = model.id.startsWith("claude-") && model.reasoning;
-      const requestHeaders: Record<string, string> = {
+      let requestHeaders: Record<string, string> = {
         ...antigravityHeaders(creds.token),
         ...(isClaudeReasoning ? { "anthropic-beta": "interleaved-thinking-2025-05-14" } : {}),
       };
@@ -1146,6 +1159,11 @@ export function streamAntigravity(
       let lastText = "";
       let received = false;
       let runtimeModel = initialRuntimeModel;
+      // Plan-quota failover state: accounts attempted in this request cannot be
+      // retried.
+      const triedAccounts = new Set<string>();
+      let currentEmail = resolveAccountEmail(creds);
+      if (currentEmail) triedAccounts.add(currentEmail);
 
       for (let emptyAttempt = 0; emptyAttempt <= 2; emptyAttempt++) {
         if (opts.signal?.aborted) throw new Error("Request was aborted");
@@ -1183,22 +1201,8 @@ export function streamAntigravity(
               if (isPlanQuotaError(response.status, lastText)) break;
               // Every other 429 is a transient throttle. Back off on the same endpoint
               // instead of hopping regions, which multiplies load on a throttled account.
-              // Honor a server Retry-After when it is short; a longer one is a cooldown
-              // that will not clear inside this loop, so burn no attempts on it.
-              const retryAfterSeconds = parseRetryAfterSeconds(
-                response.headers.get("retry-after"),
-              );
-              const retryable =
-                response.status === 429 &&
-                throttleAttempt < THROTTLE_MAX_RETRIES &&
-                (retryAfterSeconds === undefined ||
-                  retryAfterSeconds <= THROTTLE_RETRY_AFTER_CAP_SECONDS);
-              if (retryable) {
-                const delayMs =
-                  retryAfterSeconds !== undefined
-                    ? retryAfterSeconds * 1000
-                    : throttleBaseDelayMs() * 2 ** throttleAttempt;
-                await sleep(delayMs, opts.signal);
+              if (response.status === 429 && throttleAttempt < THROTTLE_MAX_RETRIES) {
+                await sleep(throttleBaseDelayMs() * 2 ** throttleAttempt, opts.signal);
                 throttleAttempt += 1;
                 continue;
               }
@@ -1275,6 +1279,39 @@ export function streamAntigravity(
           // retry it. Transient throttles keep the status + backend text so they stay
           // diagnosable and retryable.
           if (isPlanQuotaError(response?.status, lastText)) {
+            // Plan quota cannot clear before its reset time. Switch to another saved
+            // account (if any) and retry the whole request chain.
+            const fromEmail = creds.email || currentEmail;
+            const failoverAccount = await tryAccountFailover(triedAccounts, opts.signal);
+            if (failoverAccount) {
+              creds = {
+                token: failoverAccount.access,
+                projectId: failoverAccount.projectId,
+                email: failoverAccount.email || undefined,
+              };
+              currentEmail = failoverAccount.email;
+              const warmedFailover = creds.projectId ? null : await loadCodeAssist(creds.token);
+              projectId = resolveProjectId({
+                token: creds.token,
+                warmedProject: warmedFailover,
+                credentialProjectId: creds.projectId,
+              });
+              setLastProjectId(projectId);
+              requestHeaders = {
+                ...antigravityHeaders(creds.token),
+                ...(isClaudeReasoning
+                  ? { "anthropic-beta": "interleaved-thinking-2025-05-14" }
+                  : {}),
+              };
+              // The old agent/trajectory chain belongs to the previous account's project.
+              resetAntigravitySessionChain(sessionState);
+              setLastAccountFailover(fromEmail, failoverAccount.email);
+              response = undefined;
+              lastText = "";
+              // Re-enter the attempt loop under the new account (re-arm empty retries).
+              emptyAttempt = -1;
+              continue;
+            }
             throw new Error(friendly);
           }
           throw new Error(
@@ -1299,7 +1336,7 @@ export function streamAntigravity(
           output,
           model,
           sessionState,
-          isRetiredRuntime(runtimeModel),
+          isRetiredGemini35Runtime(runtimeModel),
         );
         if (received) break;
       }

@@ -53,7 +53,7 @@ async function getDispatcher(): Promise<unknown> {
         allowH2: antigravityEnv("HTTP2") === "1",
       });
     } catch {
-      // undici unavailable — fall back to Node's default fetch behaviour.
+      // undici is unavailable. Fall back to Node's default fetch behaviour.
       return undefined;
     }
   })();

@@ -1,10 +1,29 @@
 import { createHash, randomBytes } from "node:crypto";
 import { createServer, type Server } from "node:http";
-import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
+import type {
+  OAuthCredentials,
+  OAuthLoginCallbacks,
+  OAuthSelectOption,
+  OAuthSelectPrompt,
+} from "@earendil-works/pi-ai";
 import { defaultProjectId, loadCodeAssist } from "../client/client.js";
 import { escapeHtml, antigravityEnv } from "../utils/util.js";
 import { resolveCallbackHost, redactSecrets } from "../utils/security.js";
-import type { AntigravityOAuthCredentials, CallbackServer } from "../types/types.js";
+import type {
+  AntigravityAccount,
+  AntigravityOAuthCredentials,
+  CallbackServer,
+} from "../types/types.js";
+import {
+  accountTokenExpired,
+  credentialsFromAccount,
+  findAccountForCredentials,
+  getAccountByEmail,
+  loadAccountsState,
+  removeAccount,
+  switchActiveAccount,
+  upsertAccount,
+} from "./accounts.js";
 
 export const REDIRECT_URI = "http://localhost:51121/oauth-callback";
 export const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -269,7 +288,7 @@ async function acquireAuthCode(
             placeholder: "http://localhost:51121/oauth-callback?state=…&code=…",
           });
         } catch (err: unknown) {
-          // Prompt/transport failure — propagate, do not retry.
+          // Prompt or transport failure. Propagate it and do not retry.
           throw err instanceof Error ? err : new Error(String(err));
         }
         if (callbacks.signal?.aborted || settle.signal.aborted) {
@@ -316,7 +335,131 @@ async function acquireAuthCode(
   }
 }
 
-export async function loginAntigravity(
+type ManagedAccountAction =
+  | { kind: "add" }
+  | { kind: "switch"; credentials: AntigravityOAuthCredentials };
+
+const SWITCH_ACCOUNT_PREFIX = "switch:";
+const REMOVE_ACCOUNT_PREFIX = "remove:";
+const MENU_ADD_ID = "add";
+const MENU_BACK_ID = "back";
+const MENU_REMOVE_ID = "remove";
+
+/**
+ * Native account-picker via Pi's ExtensionSelectorComponent (callbacks.onSelect).
+ * Cancelling (Esc) throws "Login cancelled" like every other login surface.
+ */
+async function selectAccountOption(
+  callbacks: OAuthLoginCallbacks,
+  prompt: OAuthSelectPrompt,
+): Promise<string> {
+  const id = await callbacks.onSelect(prompt);
+  if (id === undefined) throw new Error("Login cancelled");
+  return id;
+}
+
+/**
+ * Resolve a menu selection into a usable account. Refresh the stored tokens when
+ * they are stale, then make the account active. Returns undefined when the saved
+ * refresh token is dead, meaning the user has to sign in to Google again.
+ *
+ * The refresh happens before the switch. If it fails and the user cancels the
+ * re-login, Pi must keep using the account it had before.
+ *
+ * Exported for unit tests.
+ */
+export async function activateAccountForMenu(
+  email: string,
+  signal?: AbortSignal,
+): Promise<AntigravityAccount | undefined> {
+  const saved = getAccountByEmail(email);
+  if (!saved) throw new Error(`Antigravity account not found: ${email}`);
+  let account = saved;
+  if (accountTokenExpired(account)) {
+    try {
+      account = await refreshAccount(account, signal);
+    } catch {
+      return undefined;
+    }
+  }
+  await switchActiveAccount(account.email);
+  return account;
+}
+
+async function manageAccountsMenu(
+  callbacks: OAuthLoginCallbacks,
+): Promise<ManagedAccountAction> {
+  let current = loadAccountsState();
+  for (;;) {
+    if (current.accounts.length === 0) return { kind: "add" };
+
+    const options: OAuthSelectOption[] = [
+      { id: MENU_ADD_ID, label: "Add another Google account" },
+      ...current.accounts.map((account) => ({
+        id: `${SWITCH_ACCOUNT_PREFIX}${account.email}`,
+        label:
+          account.email === current.activeEmail
+            ? `✓ ${account.email} (active)`
+            : `\u2003${account.email}`,
+      })),
+      { id: MENU_REMOVE_ID, label: "Remove an account…" },
+    ];
+
+    const selection = await selectAccountOption(callbacks, {
+      message: "Signed-in Google Antigravity accounts:",
+      options,
+    });
+
+    if (selection === MENU_ADD_ID) return { kind: "add" };
+
+    if (selection.startsWith(SWITCH_ACCOUNT_PREFIX)) {
+      const email = selection.slice(SWITCH_ACCOUNT_PREFIX.length);
+      let account: AntigravityAccount | undefined;
+      try {
+        account = await activateAccountForMenu(email, callbacks.signal);
+      } catch {
+        // The menu is stale because the account was removed elsewhere. Rebuild and re-prompt.
+        current = loadAccountsState();
+        continue;
+      }
+      if (!account) {
+        // The stored refresh token is dead. Handing these credentials to Pi would
+        // only fail on the next request, so re-authenticate this email in the
+        // browser instead (the login flow's upsert replaces this account).
+        callbacks.onProgress?.(
+          `Saved credentials for ${email} are no longer valid. Starting a fresh Google sign-in.`,
+        );
+        return { kind: "add" };
+      }
+      return { kind: "switch", credentials: credentialsFromAccount(account) };
+    }
+
+    if (selection !== MENU_REMOVE_ID) {
+      // Treat an unknown selection as a request to see the current state again.
+      current = loadAccountsState();
+      continue;
+    }
+
+    const removeOptions: OAuthSelectOption[] = [
+      ...current.accounts.map((account) => ({
+        id: `${REMOVE_ACCOUNT_PREFIX}${account.email}`,
+        label: account.email,
+      })),
+      { id: MENU_BACK_ID, label: "← Back" },
+    ];
+    const removeSelection = await selectAccountOption(callbacks, {
+      message: "Select the account to remove:",
+      options: removeOptions,
+    });
+    if (removeSelection === MENU_BACK_ID) continue;
+    if (removeSelection.startsWith(REMOVE_ACCOUNT_PREFIX)) {
+      await removeAccount(removeSelection.slice(REMOVE_ACCOUNT_PREFIX.length));
+      current = loadAccountsState();
+    }
+  }
+}
+
+async function runBrowserLoginFlow(
   callbacks: OAuthLoginCallbacks,
 ): Promise<AntigravityOAuthCredentials> {
   const { verifier, challenge } = generatePKCE();
@@ -339,7 +482,7 @@ export async function loginAntigravity(
     callbacks.onAuth({
       url: `${AUTH_URL}?${authParams.toString()}`,
       instructions:
-        "Complete Google sign-in. Pi captures the local callback automatically — or, on a remote/headless machine, paste the callback URL when prompted.",
+        "Complete Google sign-in. Pi captures the local callback automatically. On a remote or headless machine, paste the callback URL when prompted.",
     });
 
     const { code, state: returnedState } = await acquireAuthCode(state, {
@@ -392,6 +535,37 @@ export async function loginAntigravity(
   }
 }
 
+export async function loginAntigravity(
+  callbacks: OAuthLoginCallbacks,
+): Promise<AntigravityOAuthCredentials> {
+  // With saved accounts the flow starts with the native account menu; switching
+  // reactivates stored credentials without a browser round-trip unless the saved
+  // refresh token is dead, in which case the browser flow below re-authenticates.
+  const initial = loadAccountsState();
+  if (initial.accounts.length > 0 && typeof callbacks.onSelect === "function") {
+    const action = await manageAccountsMenu(callbacks);
+    if (action.kind === "switch") return action.credentials;
+  }
+
+  const credentials = await runBrowserLoginFlow(callbacks);
+  // Track the account for multi-account management (best-effort; Pi already
+  // persists the credential itself, so storage hiccups never block login).
+  if (credentials.email && credentials.projectId) {
+    try {
+      await upsertAccount({
+        email: credentials.email,
+        refresh: credentials.refresh,
+        access: credentials.access,
+        expires: credentials.expires,
+        projectId: credentials.projectId,
+      });
+    } catch {
+      // non-fatal
+    }
+  }
+  return credentials;
+}
+
 export async function refreshAntigravityToken(
   credentials: OAuthCredentials,
   signal?: AbortSignal,
@@ -418,18 +592,64 @@ export async function refreshAntigravityToken(
     refresh_token?: string;
   };
   // Every refresh mints a brand-new access token, so loadCodeAssist's token-keyed cache
-  // can never hit here — skip the extra round-trip entirely when we already know the
-  // project id (the normal case; it's set at login and doesn't change token to token).
+  // can never hit here. Skip the extra round-trip when we already know the project id.
+  // That is the normal case, since login sets it and it does not change between tokens.
   const existingProjectId = credentialProjectId(credentials);
   const discoveredProject = existingProjectId ? undefined : await loadCodeAssist(data.access_token);
   const email = credentialEmail(credentials);
-  return {
+  const updated: AntigravityOAuthCredentials = {
     ...credentials,
     refresh: data.refresh_token || credentials.refresh,
     access: data.access_token,
     expires: Date.now() + data.expires_in * 1000 - 5 * 60 * 1000,
     projectId:
       existingProjectId || discoveredProject || defaultProjectId(email || "antigravity-default"),
+  };
+  // Keep the account store current (best-effort; token rotating is not a login change,
+  // so the active account stays whoever is already active).
+  try {
+    const saved = findAccountForCredentials({
+      email,
+      refresh: credentials.refresh,
+      access: credentials.access,
+    });
+    if (saved) {
+      await upsertAccount(
+        {
+          email: saved.email,
+          refresh: updated.refresh,
+          access: updated.access,
+          expires: updated.expires,
+          projectId: updated.projectId || saved.projectId,
+        },
+        { setActive: false },
+      );
+    }
+  } catch {
+    // Persistence is additive. Pi already received the refreshed credential.
+  }
+  return updated;
+}
+
+/**
+ * Refresh a (possibly non-active) account's tokens using its own refresh token.
+ * Used by the usage adapter to poll quotas for every stored account.
+ */
+export async function refreshAccount(
+  account: AntigravityAccount,
+  signal?: AbortSignal,
+): Promise<AntigravityAccount> {
+  const updated = await refreshAntigravityToken(credentialsFromAccount(account), signal);
+  // Use the freshly refreshed credentials instead of re-reading the store. The
+  // store write may have failed silently, and returning the old tokens would
+  // lose a refresh token that Google has already rotated.
+  const stored = getAccountByEmail(account.email) ?? account;
+  return {
+    ...stored,
+    refresh: updated.refresh,
+    access: updated.access,
+    expires: updated.expires,
+    projectId: updated.projectId || stored.projectId,
   };
 }
 

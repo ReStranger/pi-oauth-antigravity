@@ -170,6 +170,20 @@ export function getOrCreateAntigravitySession(sessionId: string): AntigravitySes
   return state;
 }
 
+/**
+ * Start a fresh agent/trajectory chain for an existing session state. Used after an
+ * automatic account failover: the previous chain identifiers belong to the previous
+ * account's backend project and would cross over under the new credentials.
+ */
+export function resetAntigravitySessionChain(state: AntigravitySessionState): AntigravitySessionState {
+  state.agentId = randomUUID();
+  state.trajectoryId = randomUUID();
+  state.stepIndex = 1;
+  state.lastExecutionId = undefined;
+  state.lastUsedAt = Date.now();
+  return state;
+}
+
 export function nowRequestId(): string {
   return antigravityRequestEnvelope("unknown", false).requestId;
 }

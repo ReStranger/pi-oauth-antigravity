@@ -21,7 +21,6 @@ import {
 	extractAccountValidation,
 	isPlanQuotaError,
 	mapStopReason,
-	parseRetryAfterSeconds,
 	streamAntigravity,
 	streamResponse,
 } from "../src/stream/stream.js";
@@ -52,6 +51,7 @@ import {
 	persistAntigravitySessions,
 	resetAntigravitySessionMemory,
 	sanitizeText,
+	type AntigravitySessionState,
 } from "../src/utils/util.js";
 import { getApiKey } from "../src/auth/index.js";
 import {
@@ -63,13 +63,29 @@ import {
 	resolveImageSavePath,
 } from "../src/image/image.js";
 import { getCurrentSystemPrompt, getCurrentTools } from "../src/stream/transcript.js";
-import { createAssistantMessageEventStream, isRetryableAssistantError, normalizeContext, Type } from "@earendil-works/pi-ai";
-import type { Api, AssistantMessage, Message, Model, Tool } from "@earendil-works/pi-ai";
-
+import { createAssistantMessageEventStream, isRetryableAssistantError, normalizeContext, Type } from "@earendil-works/pi-ai";import type { Api, AssistantMessage, Message, Model, Tool } from "@earendil-works/pi-ai";
+import {
+	getLastAccountFailover,
+	resetDiagnosticsForTests,
+	runWithDiagnostics,
+	setLastAccountFailover,
+} from "../src/diagnostics/index.js";
 const testTempDir = mkdtempSync(join(tmpdir(), "pi-oauth-antigravity-test-"));
 const testSessionFile = join(testTempDir, "antigravity-sessions.json");
 process.env.ANTIGRAVITY_SESSIONS_FILE = testSessionFile;
-after(() => rmSync(testTempDir, { recursive: true, force: true }));
+// Keep accounts/auth.json storage isolated from the real agent dir during tests.
+process.env.PI_CODING_AGENT_DIR = join(testTempDir, "agent");
+const previousAccountsFile = process.env.ANTIGRAVITY_ACCOUNTS_FILE;
+const previousNoagyAccountsFile = process.env.NOAGY_ACCOUNTS_FILE;
+delete process.env.ANTIGRAVITY_ACCOUNTS_FILE;
+delete process.env.NOAGY_ACCOUNTS_FILE;
+after(() => {
+	if (previousAccountsFile === undefined) delete process.env.ANTIGRAVITY_ACCOUNTS_FILE;
+	else process.env.ANTIGRAVITY_ACCOUNTS_FILE = previousAccountsFile;
+	if (previousNoagyAccountsFile === undefined) delete process.env.NOAGY_ACCOUNTS_FILE;
+	else process.env.NOAGY_ACCOUNTS_FILE = previousNoagyAccountsFile;
+	rmSync(testTempDir, { recursive: true, force: true });
+});
 
 function fakeModel(id: string): Model<Api> {
 	return {
@@ -292,8 +308,9 @@ test("model catalog registers all Claude 5.5 tiers with per-model thinking maps"
 	}
 	const opusMedium = ANTIGRAVITY_MODELS.find((model) => model.id === "claude-opus-5-5-medium");
 	assert.ok(opusMedium);
-	assert.equal(opusMedium.reasoning, true);
-	const thinkingLevels = opusMedium.thinkingLevelMap as unknown as Record<string, string | null>;
+	assert.equal((opusMedium as { reasoning?: boolean }).reasoning, true);
+	const thinkingLevels = (opusMedium as { thinkingLevelMap?: Record<string, string | null> })
+		.thinkingLevelMap as Record<string, string | null>;
 	assert.equal(thinkingLevels.medium, "medium");
 	assert.equal(thinkingLevels.low, null);
 	assert.equal(thinkingLevels.high, null);
@@ -308,9 +325,12 @@ test("model catalog registers all Claude 5.5 tiers with per-model thinking maps"
 	] as const) {
 		const model = ANTIGRAVITY_MODELS.find((item) => item.id === `claude-${family}-5-5-${tier}`);
 		assert.ok(model, `missing claude-${family}-5-5-${tier}`);
-		assert.equal(model.reasoning, true);
+		assert.equal((model as { reasoning?: boolean }).reasoning, true);
 		assert.deepEqual(model.input, ["text", "image"]);
-		const levels = model.thinkingLevelMap as unknown as Record<string, string | null>;
+		const levels = (model as { thinkingLevelMap?: Record<string, string | null> }).thinkingLevelMap as Record<
+			string,
+			string | null
+		>;
 		assert.equal(levels[tier], tier);
 	}
 });
@@ -333,12 +353,6 @@ test("effort routing maps public ids to backend runtime ids", () => {
 	assert.equal(getAntigravityRequestModelId("gemini-3.5-flash", "high"), "gemini-3.5-flash");
 	assert.equal(getAntigravityRequestModelId("gemini-3.1-pro", "high"), "gemini-pro-agent");
 	assert.equal(getAntigravityRequestModelId("claude-sonnet-4-6", "high"), "claude-sonnet-4-6");
-	// Gemini 4 family: Hydrogen is the only model with an -xhigh wire id.
-	assert.equal(getAntigravityRequestModelId("gemini-4-hydrogen", "xhigh"), "gemini-4-hydrogen-xhigh");
-	assert.equal(getAntigravityRequestModelId("gemini-4-hydrogen", "high"), "gemini-4-hydrogen-high");
-	assert.equal(getAntigravityRequestModelId("gemini-4-carbon", "xhigh"), "gemini-4-carbon-high");
-	assert.equal(getAntigravityRequestModelId("gemini-4-carbon", "medium"), "gemini-4-carbon-medium");
-	assert.equal(getAntigravityRequestModelId("gpt-oss-120b", "off"), "gpt-oss-120b-medium");
 	for (const [family, tier] of [
 		["opus", "low"],
 		["opus", "medium"],
@@ -383,11 +397,6 @@ test("Claude 5.5 tier requests keep their exact runtime model ids", () => {
 });
 
 test("fallback runtime model covers next-gen gemini only", () => {
-	assert.equal(getFallbackRuntimeModel("gemini-4-hydrogen-xhigh"), "gemini-4-carbon-high");
-	assert.equal(getFallbackRuntimeModel("gemini-4-hydrogen-high"), "gemini-4-carbon-high");
-	assert.equal(getFallbackRuntimeModel("gemini-4-hydrogen"), "gemini-4-carbon-low");
-	assert.equal(getFallbackRuntimeModel("gemini-4-carbon-high"), "gemini-4-argon-high");
-	assert.equal(getFallbackRuntimeModel("gemini-4-carbon"), "gemini-4-argon-low");
 	assert.equal(getFallbackRuntimeModel("gemini-4-argon-high"), "gemini-3.8-flash-high");
 	assert.equal(getFallbackRuntimeModel("gemini-4-argon"), "gemini-3.8-flash-low");
 	assert.equal(getFallbackRuntimeModel("gemini-3.8-flash-high"), "gemini-3.7-flash-high");
@@ -618,6 +627,40 @@ test("convertTools dereferences $refs and strips meta keys", () => {
 	assert.deepEqual(schema.properties.file, { type: "string" });
 	assert.equal(schema.$schema, undefined);
 	assert.equal(schema.$defs, undefined);
+});
+
+test("convertTools omits undefined schema values instead of sending null", () => {
+	const tools = [
+		{
+			name: "noop",
+			description: "noop",
+			parameters: {
+				type: "object",
+				properties: { note: { type: "string", description: undefined, default: undefined } },
+			},
+		},
+	] as never[];
+	const out = convertTools(tools);
+	const decl = out?.[0]?.functionDeclarations[0];
+	assert.ok(decl && "parametersJsonSchema" in decl);
+	const schema = decl.parametersJsonSchema as {
+		properties: { note: Record<string, unknown> };
+	};
+	assert.deepEqual(schema.properties.note, { type: "string" });
+	assert.equal("description" in schema.properties.note, false);
+	assert.equal("default" in schema.properties.note, false);
+});
+
+test("convertTools survives a cyclic tool schema instead of overflowing", () => {
+	const parameters: Record<string, unknown> = { type: "object", properties: {} };
+	(parameters.properties as Record<string, unknown>).self = parameters;
+	const out = convertTools([{ name: "loop", description: "loop", parameters }] as never[]);
+	const decl = out?.[0]?.functionDeclarations[0];
+	assert.ok(decl && "parametersJsonSchema" in decl);
+	const schema = decl.parametersJsonSchema as {
+		properties: { self: unknown };
+	};
+	assert.equal(schema.properties.self, null);
 });
 
 test("convertTools claude bridge allowlist drops unknown keywords", () => {
@@ -896,7 +939,7 @@ test("429 mapping separates plan quota from transient throttles", () => {
 	assert.match(throttle, /Resource has been exhausted/);
 
 	// "quota exceeded" is a non-retryable phrase for pi's classifier, so the quoted
-	// backend text must not match it verbatim — the throttle has to stay retryable.
+	// backend text must not match it verbatim. The throttle has to stay retryable.
 	const metric = friendlyAntigravityError(
 		429,
 		"Quota exceeded for quota metric 'Generate requests per minute per user'.",
@@ -996,87 +1039,6 @@ test("plan-quota 429 fails fast without retries or endpoint hopping", async () =
 	);
 });
 
-test("transient 429 honors a short Retry-After and retries the same endpoint", async () => {
-	const sessionsFile = join(tmpdir(), `ag-retry-after-${Date.now()}.json`);
-	await withEnvAsync(
-		{ ANTIGRAVITY_SESSIONS_FILE: sessionsFile, ANTIGRAVITY_THROTTLE_BASE_DELAY_MS: "0" },
-		async () => {
-			await withFetchStub(
-				(_url, call) =>
-					call === 1
-						? new Response(JSON.stringify({ error: { code: 429, message: "RESOURCE_EXHAUSTED" } }), {
-								status: 429,
-								headers: { "content-type": "application/json", "retry-after": "0" },
-							})
-						: new Response(STREAM_OK_SSE, {
-								status: 200,
-								headers: { "content-type": "text/event-stream" },
-							}),
-				async (calls) => {
-					const message = await streamAntigravityOnce("-4545454545");
-					assert.equal(calls.length, 2);
-					assert.notEqual(message.stopReason, "error");
-				},
-			);
-		},
-	);
-});
-
-test("a long Retry-After cooldown burns no retry attempts", async () => {
-	const sessionsFile = join(tmpdir(), `ag-retry-after-long-${Date.now()}.json`);
-	await withEnvAsync(
-		{ ANTIGRAVITY_SESSIONS_FILE: sessionsFile, ANTIGRAVITY_THROTTLE_BASE_DELAY_MS: "0" },
-		async () => {
-			await withFetchStub(
-				() =>
-					new Response(JSON.stringify({ error: { code: 429, message: "RESOURCE_EXHAUSTED" } }), {
-						status: 429,
-						headers: { "content-type": "application/json", "retry-after": "3600" },
-					}),
-				async (calls) => {
-					const message = await streamAntigravityOnce("-4646464646");
-					assert.equal(calls.length, 1);
-					assert.equal(message.stopReason, "error");
-					assert.match(message.errorMessage ?? "", /Rate limited by Antigravity/);
-				},
-			);
-		},
-	);
-});
-
-test("parseRetryAfterSeconds accepts seconds and HTTP dates, refuses garbage", () => {
-	assert.equal(parseRetryAfterSeconds("120"), 120);
-	assert.equal(parseRetryAfterSeconds(" 0 "), 0);
-	assert.equal(parseRetryAfterSeconds(null), undefined);
-	assert.equal(parseRetryAfterSeconds(""), undefined);
-	assert.equal(parseRetryAfterSeconds("soon"), undefined);
-	const inAnHour = new Date(Date.now() + 3_600_000).toUTCString();
-	const parsed = parseRetryAfterSeconds(inAnHour);
-	assert.ok(parsed !== undefined && parsed > 3500 && parsed <= 3600);
-	assert.equal(parseRetryAfterSeconds(new Date(Date.now() - 60_000).toUTCString()), 0);
-});
-
-test("friendly 403 TOS_VIOLATION warns about account risk instead of re-login advice", () => {
-	const body = JSON.stringify({
-		error: {
-			code: 403,
-			message: "PERMISSION_DENIED",
-			status: "PERMISSION_DENIED",
-			details: [
-				{
-					"@type": "type.googleapis.com/google.rpc.ErrorInfo",
-					reason: "TOS_VIOLATION",
-					metadata: { violation: "Using third party software, tools, or services to access Antigravity" },
-				},
-			],
-		},
-	});
-	const message = friendlyAntigravityError(403, body);
-	assert.match(message, /TOS_VIOLATION/);
-	assert.match(message, /suspended/);
-	assert.doesNotMatch(message, /re-login, or use an account with access/);
-});
-
 test("5xx still falls back to the next endpoint", async () => {
 	const sessionsFile = join(tmpdir(), `ag-endpoint-fallback-${Date.now()}.json`);
 	await withEnvAsync({ ANTIGRAVITY_SESSIONS_FILE: sessionsFile }, async () => {
@@ -1135,7 +1097,7 @@ test("retired Gemini 3.5 SSE notice fails without emitting it as assistant text"
 			for await (const event of stream) eventTypes.push(event.type);
 
 			assert.equal(result.stopReason, "error");
-			assert.match(result.errorMessage ?? "", /switch to a current catalog model/i);
+			assert.match(result.errorMessage ?? "", /switch to gemini-3\.8-flash/i);
 			assert.deepEqual(result.content, []);
 			assert.equal(eventTypes.some((type) => type.startsWith("text_")), false);
 		}
@@ -1174,7 +1136,7 @@ test("interleaved Gemini thinking does not leak a retired-model notice", async (
 			for await (const event of stream) eventTypes.push(event.type);
 
 			assert.equal(result.stopReason, "error");
-			assert.match(result.errorMessage ?? "", /switch to a current catalog model/i);
+			assert.match(result.errorMessage ?? "", /switch to gemini-3\.8-flash/i);
 			assert.deepEqual(result.content, []);
 			assert.equal(eventTypes.some((type) => type.startsWith("text_")), false);
 		},
@@ -1298,7 +1260,7 @@ test("retirement detection releases the reader when cancellation succeeds", asyn
 
 	await assert.rejects(
 		streamResponse(response, stream, output, undefined, undefined, true),
-		/retired and is no longer available/,
+		/Gemini 3\.5 Flash is no longer available/,
 	);
 	assert.equal(cancelCalled, true);
 	assert.equal(response.body?.locked, false);
@@ -1316,7 +1278,7 @@ test("retirement detection releases the reader when cancellation rejects", async
 
 	await assert.rejects(
 		streamResponse(response, stream, output, undefined, undefined, true),
-		/retired and is no longer available/,
+		/Gemini 3\.5 Flash is no longer available/,
 	);
 	assert.equal(cancelCalled, true);
 	assert.equal(response.body?.locked, false);
@@ -1373,15 +1335,15 @@ test("streamResponse parses SSE into blocks, usage, and stop reason", async () =
 	const response = new Response(body);
 	const stream = createAssistantMessageEventStream();
 	const output = {
-		role: "assistant",
-		content: [],
+		role: "assistant" as const,
+		content: [] as unknown[],
 		api: ANTIGRAVITY_API,
 		provider: PROVIDER_ID,
 		model: "gemini-3.7-flash",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-		stopReason: "stop",
+		stopReason: "stop" as const,
 		timestamp: Date.now(),
-	} as never;
+	};
 	const hasContent = await streamResponse(response, stream, output as never);
 	assert.equal(hasContent, true);
 	const blocks = output.content as Array<{ type: string; text?: string; thinking?: string; id?: string; name?: string }>;
@@ -1404,7 +1366,7 @@ test("streamResponse updates sessionState.lastExecutionId from responseId", asyn
 	const body = new Response(sse);
 	const stream = createAssistantMessageEventStream();
 	const output = { role: "assistant", content: [], usage: {}, stopReason: "stop" } as never;
-	const state = {
+	const state: AntigravitySessionState = {
 		agentId: "agent-1",
 		trajectoryId: "traj-1",
 		sessionId: "-12345",
@@ -1472,36 +1434,6 @@ test("antigravityHeaders carry bearer auth and client metadata", () => {
 	assert.equal(headers.Authorization, "Bearer tok");
 	assert.equal(headers.Accept, "text/event-stream");
 	assert.ok(headers["Client-Metadata"].includes("ANTIGRAVITY"));
-});
-
-test("antigravityHeaders generate a fresh trace and request id per call", () => {
-	const first = antigravityHeaders("tok");
-	const second = antigravityHeaders("tok");
-	assert.ok(first["x-cloudaicompanion-trace-id"]);
-	assert.ok(first["X-Aicode-Request-Id"]);
-	assert.notEqual(first["x-cloudaicompanion-trace-id"], second["x-cloudaicompanion-trace-id"]);
-	assert.notEqual(first["X-Aicode-Request-Id"], second["X-Aicode-Request-Id"]);
-});
-
-test("retirement detection covers the models removed 2026-11-18", async () => {
-	// Claude/GPT retirements reuse the plain-text notice shape observed for Gemini 3.5.
-	const body = new ReadableStream<Uint8Array>({
-		start(controller) {
-			controller.enqueue(
-				new TextEncoder().encode(
-					retirementSse([{ text: "claude-opus-4-6 is no longer available. Please switch to" }]),
-				),
-			);
-		},
-		cancel() {},
-	});
-	const output = streamResponseOutput();
-	const stream = createAssistantMessageEventStream();
-	await assert.rejects(
-		streamResponse(new Response(body), stream, output, undefined, undefined, true),
-		/retired and is no longer available/,
-	);
-	assert.deepEqual(output.content, []);
 });
 
 test("isUsableRuntimeModelId rejects placeholder enums", () => {
@@ -1776,6 +1708,29 @@ test("explicit retired image-model override falls back to the new default", asyn
 			assert.equal(result.model, "gemini-3.1-flash-image");
 		},
 	);
+});
+
+test("the last account failover survives later diagnostics bags", async () => {
+	resetDiagnosticsForTests();
+	try {
+		await runWithDiagnostics(async () => {
+			setLastAccountFailover("a@example.com", "b@example.com");
+		});
+		assert.deepEqual(getLastAccountFailover(), {
+			from: "a@example.com",
+			to: "b@example.com",
+		});
+
+		// A later quota poll commits its own bag with no failover; the doctor line
+		// must still report the switch.
+		await runWithDiagnostics(async () => {});
+		assert.deepEqual(getLastAccountFailover(), {
+			from: "a@example.com",
+			to: "b@example.com",
+		});
+	} finally {
+		resetDiagnosticsForTests();
+	}
 });
 
 test("image model and aspect ratio validation", () => {

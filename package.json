@@ -21,7 +21,9 @@
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/**/*.test.ts",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "extract-antigravity": "tsx scripts/extract-antigravity.ts --write",
+    "extract-antigravity:check": "tsx scripts/extract-antigravity.ts --check"
   },
   "keywords": [
     "pi",
@@ -68,7 +70,7 @@
   },
   "pi": {
     "extensions": [
-      "./dist/index.js"
+      "./src/index.ts"
     ]
   }
 }

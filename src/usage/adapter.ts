@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type {
   AccountStatus,
+  QuotaPeriod,
   UsageAccount,
   UsageMetric,
   UsageModelPool,
@@ -8,9 +9,17 @@ import type {
   UsageQuotaBucket,
 } from "pi-usage-core";
 import { PROVIDER_ID } from "../models/models.js";
-import { runWithDiagnostics } from "../diagnostics/diagnostics.js";
+import { runWithDetachedDiagnostics } from "../diagnostics/diagnostics.js";
+import { maskEmail } from "../utils/security.js";
 import { fetchAccountUsage, resolveApiKeyFromContext } from "./usage.js";
-import type { AccountUsage } from "../types/types.js";
+import {
+  accountToApiKey,
+  accountTokenExpired,
+  loadAccountsState,
+  switchActiveAccount,
+} from "../auth/accounts.js";
+import { refreshAccount } from "../auth/oauth.js";
+import type { AntigravityAccount, AccountUsage } from "../types/types.js";
 
 declare global {
   var __PI_USAGE__:
@@ -21,8 +30,61 @@ declare global {
     | undefined;
 }
 
-export function convertUsageToAccount(usage: AccountUsage): UsageAccount {
+/** Adapter exposes account switching on top of the standard interface. */
+export type AntigravityUsageAdapter = UsageProviderAdapter & {
+  /** Make a saved account active and mirror it into auth.json. */
+  switchAccount(accountId: string): Promise<AntigravityAccount>;
+};
+
+/**
+ * Map a quota bucket's window onto a footer period. `window` is authoritative when present;
+ * the label is consulted only when `window` is missing or unrecognized, because a label can
+ * describe a rolling detail ("Weekly (rolling 5h)") that must not override the real window.
+ * Unrecognized input stays undefined so the footer falls back to the bucket label.
+ */
+const PERIOD_PATTERNS: ReadonlyArray<readonly [RegExp, QuotaPeriod]> = [
+  // "FIVE_HOURS", "SESSION_5H", "WINDOW_5H", "ROLLING_5_HOURS", "5-hour session".
+  // The lookbehind rejects decimals so "2.5h" is not read as a 5-hour window.
+  [/\bfive\b|(?<![\d.])5\s*(?:hours?|hrs?|h)\b/, "5h"],
+  [/\b(?:daily|per\s+day)\b/, "daily"],
+  [/\b(?:weekly|per\s+week)\b/, "weekly"],
+  [/\b(?:monthly|per\s+month)\b/, "monthly"],
+];
+
+function matchPeriod(raw: string | undefined): QuotaPeriod | undefined {
+  if (!raw) return undefined;
+  // `_` counts as a word character, so "ROLLING_5_HOURS" would defeat `\b`; split it out.
+  const normalized = raw.toLowerCase().replace(/[_-]+/g, " ");
+  for (const [pattern, period] of PERIOD_PATTERNS) {
+    if (pattern.test(normalized)) return period;
+  }
+  return undefined;
+}
+
+function toQuotaPeriod(
+  bucket: AccountUsage["groups"][number]["buckets"][number],
+): QuotaPeriod | undefined {
+  return matchPeriod(bucket.window) ?? matchPeriod(bucket.displayName);
+}
+
+function uniquePoolId(base: string, taken: Set<string>): string {
+  if (!taken.has(base)) {
+    taken.add(base);
+    return base;
+  }
+  let n = 2;
+  while (taken.has(`${base}-${n}`)) n++;
+  const id = `${base}-${n}`;
+  taken.add(id);
+  return id;
+}
+
+export function convertUsageToAccount(
+  usage: AccountUsage,
+  options: { activeEmail?: string; email?: string } = {},
+): UsageAccount {
   const pools: UsageModelPool[] = [];
+  const takenPoolIds = new Set<string>();
 
   for (const group of usage.groups) {
     const isGemini = /gemini/i.test(group.displayName);
@@ -46,7 +108,7 @@ export function convertUsageToAccount(usage: AccountUsage): UsageAccount {
       const remFraction = typeof b.remainingFraction === "number" ? b.remainingFraction : 1.0;
       const remaining = Math.round(remFraction * 100);
       const used = Math.max(0, 100 - remaining);
-      const is5h = /five hour|5h/i.test(b.displayName) || /5h|five_hour/i.test(b.window || "");
+      const period = toQuotaPeriod(b);
 
       let resetsAt: number | undefined;
       if (b.resetTime) {
@@ -57,14 +119,18 @@ export function convertUsageToAccount(usage: AccountUsage): UsageAccount {
       return {
         id: b.bucketId || b.displayName,
         label: b.displayName,
-        period: is5h ? "5h" : "weekly",
+        period,
         used,
         remaining,
         unit: "percent",
         resetsAt,
-        isPrimary: is5h,
+        isPrimary: period === "5h",
       };
     });
+
+    // parseQuotaSummary keeps a named group even when every bucket was filtered out. Such a
+    // group carries no usage data, so drop it before it consumes a pool id.
+    if (buckets.length === 0) continue;
 
     const firstBucket = buckets[0];
     if (firstBucket && !buckets.some((b) => b.isPrimary)) {
@@ -72,7 +138,7 @@ export function convertUsageToAccount(usage: AccountUsage): UsageAccount {
     }
 
     pools.push({
-      id: poolId,
+      id: uniquePoolId(poolId, takenPoolIds),
       name: group.displayName,
       description: group.description,
       modelKeys,
@@ -80,8 +146,8 @@ export function convertUsageToAccount(usage: AccountUsage): UsageAccount {
     });
   }
 
-  // Fallback: if groups is empty (e.g. free tier accounts without retrieveUserQuotaSummary access),
-  // extract quota buckets from models catalog
+  // Fallback: the quota summary is subscription-gated, so free-tier accounts get no groups at
+  // all. Derive pools from the per-model catalog instead when nothing usable came back.
   if (pools.length === 0 && usage.models.length > 0) {
     const geminiModels = usage.models.filter(
       (m) => m.modelId.startsWith("gemini") && m.remainingFraction !== undefined,
@@ -110,7 +176,9 @@ export function convertUsageToAccount(usage: AccountUsage): UsageAccount {
           {
             id: "gemini-shared",
             label: "Gemini Pool",
-            period: "5h",
+            // Per-model quotaInfo carries a remaining fraction and the next reset, not a
+            // window, so do not claim a 5h session the backend never reported.
+            period: "total",
             used,
             remaining,
             unit: "percent",
@@ -139,7 +207,7 @@ export function convertUsageToAccount(usage: AccountUsage): UsageAccount {
           {
             id: "claude-gpt-shared",
             label: "Claude & GPT Pool",
-            period: "5h",
+            period: "total",
             used,
             remaining,
             unit: "percent",
@@ -168,30 +236,87 @@ export function convertUsageToAccount(usage: AccountUsage): UsageAccount {
     });
   }
 
-  const hasPools = pools.length > 0;
-  const isError = !hasPools && Boolean(usage.quotaSummaryError);
+  // Report a quota failure rather than a "ready" account that renders nothing.
+  const hasBuckets = pools.some((p) => p.buckets.length > 0);
+  const isError = !hasBuckets && Boolean(usage.quotaSummaryError);
   const status: AccountStatus = isError ? "error" : "ready";
   const errorMessage = isError ? usage.quotaSummaryError : undefined;
 
+  // Multi-account polling passes the stored email so the dashboard keeps a stable,
+  // switchable id even when the backend omits it. The legacy single-account path
+  // keeps upstream's masked identity.
+  const identityEmail = options.email || usage.email;
+  const id = options.email || usage.projectId || "antigravity-active";
+  const name = options.email || "Account";
+  const email = options.email || maskEmail(usage.email);
+
   return {
-    id: usage.projectId || "antigravity-active",
-    name: "Account",
-    email: usage.email,
+    id,
+    name,
+    email,
     status,
     errorMessage,
-    isActive: true,
+    isActive: options.activeEmail ? Boolean(identityEmail) && identityEmail === options.activeEmail : true,
     lastUpdated: usage.fetchedAt || Date.now(),
     pools,
     metrics,
   };
 }
 
-export function createAntigravityUsageAdapter(): UsageProviderAdapter {
+function usageAccountForError(
+  account: AntigravityAccount,
+  message: string,
+  status: AccountStatus,
+  activeEmail?: string,
+): UsageAccount {
+  const id = account.email || account.projectId;
   return {
-    id: PROVIDER_ID,
-    displayName: "Google Antigravity",
+    id,
+    name: id,
+    email: account.email,
+    status,
+    errorMessage: message,
+    isActive: activeEmail ? account.email === activeEmail : true,
+    pools: [],
+    lastUpdated: Date.now(),
+  };
+}
 
-    async getAccounts(ctx: ExtensionContext): Promise<UsageAccount[]> {
+async function fetchOneAccountUsage(
+  account: AntigravityAccount,
+  activeEmail?: string,
+): Promise<UsageAccount> {
+  try {
+    // Secondary (inactive) accounts keep their own tokens fresh during usage
+    // polling so failover can switch to them instantly.
+    let current = account;
+    if (accountTokenExpired(current)) {
+      try {
+        current = await refreshAccount(current);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return usageAccountForError(current, `Token refresh failed: ${msg}`, "auth-required", activeEmail);
+      }
+    }
+    // Detached bag: footer/dashboard polls must not become the `lastError` that
+    // /antigravity.doctor reports for the last model request.
+    const usage = await runWithDetachedDiagnostics(() =>
+      fetchAccountUsage(accountToApiKey(current)),
+    );
+    return convertUsageToAccount(usage, { activeEmail, email: current.email });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return usageAccountForError(account, msg, "error", activeEmail);
+  }
+}
+
+export function createAntigravityUsageAdapter(): AntigravityUsageAdapter {
+  async function getAccounts(ctx: ExtensionContext): Promise<UsageAccount[]> {
+    // Legacy path. With no saved accounts in the store, keep the single-account
+    // behavior driven by auth.json, which covers users that never migrated.
+    const state = loadAccountsState();
+    if (state.accounts.length === 0) {
+      const activeEmail = state.activeEmail;
       const apiKey = await resolveApiKeyFromContext(ctx);
       if (!apiKey) {
         return [
@@ -207,8 +332,8 @@ export function createAntigravityUsageAdapter(): UsageProviderAdapter {
       }
 
       try {
-        const usage = await runWithDiagnostics(() => fetchAccountUsage(apiKey));
-        return [convertUsageToAccount(usage)];
+        const usage = await runWithDetachedDiagnostics(() => fetchAccountUsage(apiKey));
+        return [convertUsageToAccount(usage, { activeEmail })];
       } catch (err) {
         return [
           {
@@ -221,21 +346,60 @@ export function createAntigravityUsageAdapter(): UsageProviderAdapter {
           },
         ];
       }
-    },
+    }
 
-    async refresh(ctx: ExtensionContext): Promise<UsageAccount[]> {
-      return this.getAccounts(ctx);
+    const activeEmail = state.activeEmail;
+    // Poll every account concurrently: the dashboard shows one tab per account.
+    return Promise.all(
+      state.accounts.map((account) => fetchOneAccountUsage(account, activeEmail)),
+    );
+  }
+
+  return {
+    id: PROVIDER_ID,
+    displayName: "Google Antigravity",
+    getAccounts,
+    // Closure rather than `this.getAccounts`: the registry calls adapters as methods today,
+    // but a detached reference must not break the refresh path.
+    refresh: (ctx: ExtensionContext) => getAccounts(ctx),
+    async switchAccount(accountId: string): Promise<AntigravityAccount> {
+      return switchActiveAccount(accountId);
     },
   };
 }
 
-export function registerAntigravityUsageAdapter(pi: ExtensionAPI): UsageProviderAdapter {
+/**
+ * Whether the `pi-usage-core` extension is loaded in this process.
+ *
+ * The core installs `globalThis.__PI_USAGE__` while its extension factory runs, so a lazy
+ * check is required: extension load order between the two packages is not guaranteed, and
+ * this package must stay usable without the core (`pi-usage-core` is a devDependency that
+ * supplies types only, never a runtime import).
+ */
+export function isUsageCoreAvailable(): boolean {
+  return typeof globalThis.__PI_USAGE__?.register === "function";
+}
+
+export function registerAntigravityUsageAdapter(pi: ExtensionAPI): AntigravityUsageAdapter {
   const adapter = createAntigravityUsageAdapter();
 
   pi.events.emit("pi-usage:register", adapter);
 
   pi.events.on("pi-usage:discover", () => {
     pi.events.emit("pi-usage:register", adapter);
+  });
+
+  // Forward-compatible hook: pi-usage-core 0.1.0 has no switch event yet, so
+  // nothing emits this today. Account ids are emails. Kept so a dashboard that
+  // adds pi-usage:switch-account starts working without a release here.
+  pi.events.on("pi-usage:switch-account", (data: unknown) => {
+    const payload = data as { providerId?: string; accountId?: string } | undefined;
+    if (!payload || payload.providerId !== PROVIDER_ID || typeof payload.accountId !== "string") {
+      return;
+    }
+    void switchActiveAccount(payload.accountId).catch(() => {
+      // Ignore an unknown or stale accountId. The dashboard state stays unchanged.
+    });
   });
 
   if (globalThis.__PI_USAGE__?.register) {

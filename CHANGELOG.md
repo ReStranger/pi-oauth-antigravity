@@ -7,9 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Multi-account support: saved accounts in `antigravity-accounts.json` (override with `ANTIGRAVITY_ACCOUNTS_FILE`), an `/antigravity.accounts` command, an account menu on `/login antigravity`, per-account quota polling, and failover to the next account on a plan-quota 429. The extension migrates existing single-account installs from `auth.json` on first load.
+- `/antigravity.doctor` reports `accountFailover=` when the last request switched accounts.
+
 ### Changed
 - Replaced the `/antigravity.usage` command with native integration for [`pi-usage-core`](https://github.com/ReStranger/pi-usage-core). Antigravity quota pools (Gemini 5h/weekly, Claude+GPT 5h) and account details are now registered automatically into Pi's unified `/usage` dashboard and persistent footer status line via `pi.events` and `globalThis.__PI_USAGE__`.
-- Updated `/antigravity.doctor` diagnostics to reflect available commands (`/antigravity.models`, `/antigravity.doctor`, `/antigravity.image`).
+- Updated `/antigravity.doctor` diagnostics to reflect available commands (`/antigravity.models`, `/antigravity.doctor`, `/antigravity.accounts`, `/antigravity.image`).
+- Usage account ids are now the account email (falling back to the project id) instead of always the project id.
+
+### Fixed
+- The extension no longer rewrites a corrupt or unreadable `auth.json` while mirroring the active account; doing so deleted other providers' stored credentials.
+- Refreshing a secondary account no longer rewrites `auth.json`, which belongs to the active credential.
+- `refreshAccount` returns the freshly rotated tokens instead of re-reading the store, so a failed write can no longer lose a refresh token that Google already rotated.
+- Selecting a saved account in the `/login antigravity` menu refreshes stale tokens before activating it. If the refresh token is dead, the menu starts a fresh sign-in; if the user cancels, the previous account stays active.
+- Token-schema normalization no longer turns `undefined` schema values into `null`, and cyclic schemas no longer overflow the stack.
+- The store normalizes account rows that are missing `addedAt`/`lastUsedAt` on load, instead of rendering `NaN` and breaking failover ordering.
 
 
 ## [0.1.8] - 2026-10-15

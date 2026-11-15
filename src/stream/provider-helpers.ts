@@ -26,6 +26,57 @@ type ToolWithParameters = Tool & {
   constrainedSampling?: ConstrainedSamplingConfig;
 };
 
+/**
+ * JSON tree value produced when normalizing tool-parameter JSON Schemas. Named
+ * domain alias so schema helpers never handle bare `unknown` past the boundary.
+ */
+export type JsonSchemaValue =
+  | null
+  | boolean
+  | number
+  | string
+  | JsonSchemaValue[]
+  | { [key: string]: JsonSchemaValue };
+
+/**
+ * Parse an unknown inbound value into the JSON Schema value tree (boundary
+ * operation): primitives pass through and arrays/records are walked recursively.
+ * Object keys whose value is `undefined` are omitted, matching `JSON.stringify`;
+ * other values JSON cannot represent (functions, symbols, `undefined` inside
+ * arrays) become null. Cyclic references are cut to null so a malformed schema
+ * can never overflow the stack.
+ */
+export function asJsonSchemaValue(value: unknown): JsonSchemaValue {
+  return toJsonSchemaValue(value, new Set<object>());
+}
+
+function toJsonSchemaValue(value: unknown, ancestors: Set<object>): JsonSchemaValue {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") return value;
+  if (typeof value === "number") return value;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "object") {
+    // Only ancestors are tracked (not every seen node), so shared sub-schemas are
+    // still copied while true cycles are broken.
+    if (ancestors.has(value)) return null;
+    ancestors.add(value);
+    try {
+      if (Array.isArray(value)) {
+        return value.map((entry) => toJsonSchemaValue(entry, ancestors));
+      }
+      const out: { [key: string]: JsonSchemaValue } = {};
+      for (const [key, entry] of Object.entries(value)) {
+        if (entry === undefined) continue; // JSON.stringify omits undefined object keys
+        out[key] = toJsonSchemaValue(entry, ancestors);
+      }
+      return out;
+    } finally {
+      ancestors.delete(value);
+    }
+  }
+  return null;
+}
+
 class UnsupportedStrictJsonSchemaError extends Error {}
 
 const UNSUPPORTED_STRICT_SCHEMA_KEYS = [
@@ -146,10 +197,14 @@ function makeStrictJsonSchema(schema: unknown): Record<string, unknown> {
   return cloned;
 }
 
-export function getJsonSchemaToolParameters(tool: Tool, strict: boolean | undefined): unknown {
+/** Run tool parameters through the JSON Schema value tree before downstream normalization. */
+export function getJsonSchemaToolParameters(
+  tool: Tool,
+  strict: boolean | undefined,
+): JsonSchemaValue {
   const parameters = (tool as ToolWithParameters).parameters;
-  if (strict !== true) return parameters;
-  return makeStrictJsonSchema(parameters);
+  if (strict !== true) return asJsonSchemaValue(parameters);
+  return asJsonSchemaValue(makeStrictJsonSchema(parameters));
 }
 
 export function resolveJsonSchemaStrictSampling(
