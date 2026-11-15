@@ -1,0 +1,75 @@
+name: Sync Antigravity Upstream Contract
+
+on:
+  schedule:
+    # Run daily at 05:30 UTC to detect newly released Antigravity CLI versions.
+    - cron: "30 5 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Target release tag in google-antigravity/antigravity-cli (default: latest stable X.Y.Z)"
+        required: false
+        type: string
+      model:
+        description: "Model passed to the CLI during capture (default: CLI default)"
+        required: false
+        type: string
+
+concurrency:
+  group: sync-antigravity-upstream-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync-contract:
+    name: Dump prompt & tools from the official CLI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Dump system prompt, tool catalog, and Hub identity
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_MODEL: ${{ inputs.model }}
+        run: |
+          args=()
+          if [ -n "$INPUT_TAG" ]; then args+=(--tag "$INPUT_TAG"); fi
+          if [ -n "$INPUT_MODEL" ]; then args+=(--model "$INPUT_MODEL"); fi
+          npm run extract-antigravity -- "${args[@]}"
+
+      - name: Run typecheck and tests
+        run: |
+          npm run typecheck
+          npm test
+
+      - name: Commit and push changes if upstream changed
+        run: |
+          if git diff --quiet -- src/antigravity-upstream.ts; then
+            echo "No upstream changes to commit"
+            exit 0
+          fi
+
+          release=$(sed -n 's/^export const ANTIGRAVITY_UPSTREAM_RELEASE[^"]*"\([^"]*\)".*/\1/p' src/antigravity-upstream.ts)
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add src/antigravity-upstream.ts
+          git commit -m "chore(upstream): sync Antigravity prompt, tools, and client identity with release ${release}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

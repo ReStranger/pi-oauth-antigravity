@@ -19,6 +19,15 @@ import {
 } from "./provider-helpers.js";
 import { getCurrentSystemPrompt, getCurrentTools } from "./transcript.js";
 import {
+  ANTIGRAVITY_UPSTREAM_PROMPT_MARKER,
+  antigravityUpstreamContractEnabled,
+  antigravityUpstreamOs,
+  antigravityUpstreamPromptValues,
+  mapAntigravityUpstreamToolCall,
+  renderAntigravityUpstreamSystemPrompt,
+} from "../antigravity-contract.js";
+import { ANTIGRAVITY_UPSTREAM_TOOLS } from "../antigravity-upstream.js";
+import {
   antigravityHeaders,
   DEFAULT_ENDPOINT,
   endpointCandidates,
@@ -143,6 +152,27 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 /** Plan quota is deterministic; everything else on a 429 is a transient throttle. */
 export function isPlanQuotaError(status: number | undefined, text: string): boolean {
   return status === 429 && /Individual quota reached/i.test(text);
+}
+
+/**
+ * Transient 429s may carry a server-provided Retry-After (seconds or HTTP-date, CPA
+ * issue #6646). Trust it over the local backoff when it is short enough to be worth a
+ * retry; a longer value is a cooldown that will not clear inside this loop.
+ */
+export const THROTTLE_RETRY_AFTER_CAP_SECONDS = 60;
+
+export function parseRetryAfterSeconds(raw: string | null | undefined): number | undefined {
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  if (/^\d+$/.test(trimmed)) {
+    const seconds = Number(trimmed);
+    return Number.isFinite(seconds) && seconds >= 0 ? seconds : undefined;
+  }
+  const date = Date.parse(trimmed);
+  if (Number.isNaN(date)) return undefined;
+  const seconds = Math.round((date - Date.now()) / 1000);
+  return seconds >= 0 ? seconds : 0;
 }
 
 /**
@@ -543,6 +573,34 @@ export function convertTools(
   ];
 }
 
+/** Genuine Antigravity declarations; schemas stay byte-faithful on the Gemini path. */
+export function convertUpstreamTools(
+  useLegacyParameters = false,
+): GeminiFunctionDeclaration[] {
+  const os = antigravityUpstreamOs();
+  return Object.entries(ANTIGRAVITY_UPSTREAM_TOOLS).map(([name, tool]) => {
+    const genuine = asJsonSchemaValue(tool.parameters);
+    return {
+      name,
+      // The capture runs on Linux; the official client renders the host OS
+      // into `run_command`'s description at runtime.
+      description: tool.description.replace(
+        /Operating System: (?:linux|macos|darwin|windows)\./i,
+        `Operating System: ${os}.`,
+      ),
+      ...(useLegacyParameters
+        ? {
+            // Claude/GPT-OSS custom-tool bridge only accepts the protobuf Schema
+            // allowlist, so the genuine schema has to be reduced there.
+            parameters: normalizeCustomToolSchema(
+              stripMetaSchema(ensureRootObjectSchema(dereferenceSchema(genuine))),
+            ),
+          }
+        : { parametersJsonSchema: genuine }),
+    };
+  });
+}
+
 function mapToolChoiceMode(
   toolChoice: AntigravityStreamOptions["toolChoice"],
 ): GeminiToolCallingMode {
@@ -561,15 +619,44 @@ export function buildRequest(
   runtimeModel: string,
   sessionState?: AntigravitySessionState,
 ): AntigravityGenerateRequest {
-  const systemPrompt = getCurrentSystemPrompt(context);
+  const sid = options.sessionId || deriveAntigravitySessionId(context);
+  const systemPrompt = getCurrentSystemPrompt(context).trim();
+  const upstreamPrompt = antigravityUpstreamContractEnabled()
+    ? renderAntigravityUpstreamSystemPrompt(antigravityUpstreamPromptValues(sid))
+    : "";
+  const contents = convertMessages(model, context, runtimeModel);
+
+  // Antigravity responds 429 RESOURCE_EXHAUSTED when systemInstruction carries a
+  // third-party agent's prompt (Pi's prompt is fingerprinted). The identical text is
+  // accepted as a leading user turn, so Pi's prompt stays authoritative there and
+  // systemInstruction is reserved for the genuine Antigravity prompt.
+  if (systemPrompt) {
+    const promptPart: GeminiTextPart = { text: sanitizeText(systemPrompt) };
+    const first = contents[0];
+    if (first?.role === GeminiRole.User) {
+      first.parts.unshift(promptPart);
+    } else {
+      contents.unshift({ role: GeminiRole.User, parts: [promptPart] });
+    }
+  }
+
+  const promptParts: string[] = [];
+  const alreadyHasUpstream = systemPrompt.includes(ANTIGRAVITY_UPSTREAM_PROMPT_MARKER);
+  if (upstreamPrompt && !alreadyHasUpstream) {
+    promptParts.push(upstreamPrompt);
+  } else if (!systemPrompt) {
+    promptParts.push(ANTIGRAVITY_SYSTEM_INSTRUCTION, ANTIGRAVITY_NO_PREAMBLE_INSTRUCTION);
+  }
   const request: GeminiRequestBody = {
-    contents: convertMessages(model, context, runtimeModel),
-    systemInstruction: {
-      role: GeminiRole.User,
-      parts: systemPrompt
-        ? [{ text: sanitizeText(systemPrompt) }]
-        : [{ text: ANTIGRAVITY_SYSTEM_INSTRUCTION }, { text: ANTIGRAVITY_NO_PREAMBLE_INSTRUCTION }],
-    },
+    contents,
+    ...(promptParts.length
+      ? {
+          systemInstruction: {
+            role: GeminiRole.User,
+            parts: promptParts.map((text) => ({ text: sanitizeText(text) })),
+          },
+        }
+      : {}),
   };
 
   const generationConfig: GeminiGenerationConfig = {};
@@ -585,12 +672,22 @@ export function buildRequest(
   if (Object.keys(generationConfig).length) request.generationConfig = generationConfig;
 
   const isClaude = model.id.startsWith("claude-") || runtimeModel.startsWith("claude-");
-  const tools = convertTools(
+  const useLegacyParameters = isClaude || model.id.startsWith("gpt-oss-");
+  const converted = convertTools(
     getCurrentTools(context),
-    isClaude || model.id.startsWith("gpt-oss-"),
+    useLegacyParameters,
     // Keep Antigravity on the plain-schema compatibility path with VALIDATED calls.
     false,
   );
+  const piDeclarations = converted?.[0]?.functionDeclarations ?? [];
+  const declaredNames = new Set(piDeclarations.map((declaration) => declaration.name));
+  const upstreamDeclarations = antigravityUpstreamContractEnabled()
+    ? convertUpstreamTools(useLegacyParameters).filter(
+        (declaration) => !declaredNames.has(declaration.name),
+      )
+    : [];
+  const declarations = [...piDeclarations, ...upstreamDeclarations];
+  const tools = declarations.length > 0 ? [{ functionDeclarations: declarations }] : undefined;
   if (tools) {
     request.tools = tools;
     request.toolConfig = {
@@ -607,7 +704,6 @@ export function buildRequest(
     };
   }
 
-  const sid = options.sessionId || deriveAntigravitySessionId(context);
   const state = sessionState ?? getOrCreateAntigravitySession(sid);
   const envelope = antigravityRequestEnvelope(runtimeModel, isClaude, state);
   request.sessionId = envelope.sessionId;
@@ -630,17 +726,32 @@ export function mapStopReason(reason: string | undefined): StopReason {
   return reason ? StopReason.Error : StopReason.Stop;
 }
 
-const RETIRED_GEMINI_35_NOTICE_PREFIX =
-  "gemini 3.5 flash is no longer available. please switch to";
+/**
+ * Backends answer retired models with a plain text notice instead of an error. The 3.5
+ * wording is the observed template; the 2026-11-18 removals (Claude 4.6, Sonnet 4.6,
+ * GPT-OSS 120B) are expected to reuse it. Match on the model name prefix, not the full
+ * sentence, so wording drift on the suffix stays harmless.
+ */
+const RETIRED_NOTICE_PREFIXES = [
+  "gemini 3.5 flash is no longer available. please switch to",
+  "claude-opus-4-6 is no longer available",
+  "claude-sonnet-4-6 is no longer available",
+  "gpt-oss-120b is no longer available",
+];
 
-function isRetiredGemini35Runtime(runtimeModel: string): boolean {
-  return /^(?:gemini-3\.5-flash(?:-|$)|gemini-3-flash-agent$)/i.test(runtimeModel);
+const RETIRED_RUNTIME_PATTERN =
+  /^(?:gemini-3\.5-flash(?:-|$)|gemini-3-flash-agent$|claude-opus-4-6|claude-sonnet-4-6|gpt-oss-120b)/i;
+
+function isRetiredRuntime(runtimeModel: string): boolean {
+  return RETIRED_RUNTIME_PATTERN.test(runtimeModel);
 }
 
 function retiredNoticePrefixState(text: string): "possible" | "match" | "no-match" {
   const normalized = text.trimStart().replace(/\s+/g, " ").toLowerCase();
-  if (normalized.startsWith(RETIRED_GEMINI_35_NOTICE_PREFIX)) return "match";
-  if (RETIRED_GEMINI_35_NOTICE_PREFIX.startsWith(normalized)) return "possible";
+  for (const prefix of RETIRED_NOTICE_PREFIXES) {
+    if (normalized.startsWith(prefix)) return "match";
+    if (prefix.startsWith(normalized) && normalized.length > 0) return "possible";
+  }
   return "no-match";
 }
 
@@ -746,6 +857,18 @@ export function friendlyAntigravityError(status: number | undefined, text: strin
     // Fallback for gateways that strip `details` but keep the message.
     if (/verify your account|VALIDATION_REQUIRED/i.test(msg)) {
       return formatAccountValidation({ message: msg });
+    }
+    // Google is actively enforcing third-party OAuth use (403 PERMISSION_DENIED,
+    // reason TOS_VIOLATION; the appeal copy names "third party software"). The reason
+    // lives in error.details, which jsonOrTextError drops — match the raw body. Retries,
+    // re-login and model switches do not clear it, and the account itself is at risk.
+    if (/TOS_VIOLATION|third[- ]party (software|tools|services|clients?)/i.test(text)) {
+      return (
+        "Antigravity flagged this account for third-party access (TOS_VIOLATION). " +
+        "Retries and re-login will not clear it; further use may get the account suspended. " +
+        "Next: stop using third-party clients on this account and appeal through Google support. " +
+        `Backend said: ${msg}`
+      );
     }
     if (/permission|forbidden|access/i.test(msg)) {
       return "Antigravity access was denied for this account or project. Next: try another model, re-login, or use an account with access.";
@@ -976,8 +1099,8 @@ export async function streamResponse(
               }
               reader.releaseLock();
               throw new Error(
-                "Antigravity reports that Gemini 3.5 Flash is no longer available. " +
-                  "Next: switch to gemini-3.8-flash, gemini-3.7-flash, or another catalog model.",
+                "Antigravity reports that this model has been retired and is no longer available. " +
+                  "Next: switch to a current catalog model (see /antigravity.models).",
               );
             }
             if (noticeState !== "possible") flushPendingRetiredNoticeParts();
@@ -999,11 +1122,19 @@ export async function streamResponse(
           flushPendingRetiredNoticeParts();
           finishCurrent();
           const rawId = part.functionCall.id || "";
+          const bridged = antigravityUpstreamContractEnabled()
+            ? mapAntigravityUpstreamToolCall(
+                part.functionCall.name || "",
+                part.functionCall.args,
+              )
+            : undefined;
+          const toolName = (bridged?.name ?? part.functionCall.name) || "";
+          const toolArguments = bridged?.arguments ?? asToolCallArguments(part.functionCall.args);
           const toolCall: ToolCall = {
             type: "toolCall",
-            id: sanitizeToolCallId(rawId, part.functionCall.name),
-            name: part.functionCall.name || "",
-            arguments: asToolCallArguments(part.functionCall.args),
+            id: sanitizeToolCallId(rawId, toolName),
+            name: toolName,
+            arguments: toolArguments,
             ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}),
           };
           blocks.push(toolCall);
@@ -1201,8 +1332,22 @@ export function streamAntigravity(
               if (isPlanQuotaError(response.status, lastText)) break;
               // Every other 429 is a transient throttle. Back off on the same endpoint
               // instead of hopping regions, which multiplies load on a throttled account.
-              if (response.status === 429 && throttleAttempt < THROTTLE_MAX_RETRIES) {
-                await sleep(throttleBaseDelayMs() * 2 ** throttleAttempt, opts.signal);
+              // Honor a server Retry-After when it is short; a longer one is a cooldown
+              // that will not clear inside this loop, so burn no attempts on it.
+              const retryAfterSeconds = parseRetryAfterSeconds(
+                response.headers.get("retry-after"),
+              );
+              const retryable =
+                response.status === 429 &&
+                throttleAttempt < THROTTLE_MAX_RETRIES &&
+                (retryAfterSeconds === undefined ||
+                  retryAfterSeconds <= THROTTLE_RETRY_AFTER_CAP_SECONDS);
+              if (retryable) {
+                const delayMs =
+                  retryAfterSeconds !== undefined
+                    ? retryAfterSeconds * 1000
+                    : throttleBaseDelayMs() * 2 ** throttleAttempt;
+                await sleep(delayMs, opts.signal);
                 throttleAttempt += 1;
                 continue;
               }
@@ -1336,7 +1481,7 @@ export function streamAntigravity(
           output,
           model,
           sessionState,
-          isRetiredGemini35Runtime(runtimeModel),
+          isRetiredRuntime(runtimeModel),
         );
         if (received) break;
       }

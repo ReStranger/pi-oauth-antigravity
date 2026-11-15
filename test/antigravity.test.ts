@@ -17,10 +17,12 @@ import {
 	buildRequest,
 	convertMessages,
 	convertTools,
+	convertUpstreamTools,
 	friendlyAntigravityError,
 	extractAccountValidation,
 	isPlanQuotaError,
 	mapStopReason,
+	parseRetryAfterSeconds,
 	streamAntigravity,
 	streamResponse,
 } from "../src/stream/stream.js";
@@ -37,6 +39,10 @@ import {
 	resolveProjectId,
 	stableProjectId,
 } from "../src/client/client.js";
+import {
+	ANTIGRAVITY_UPSTREAM_HUB_CL,
+	ANTIGRAVITY_UPSTREAM_HUB_VERSION,
+} from "../src/antigravity-upstream.js";
 import {
 	assertSafeApiBaseUrl,
 	maskEmail,
@@ -353,6 +359,12 @@ test("effort routing maps public ids to backend runtime ids", () => {
 	assert.equal(getAntigravityRequestModelId("gemini-3.5-flash", "high"), "gemini-3.5-flash");
 	assert.equal(getAntigravityRequestModelId("gemini-3.1-pro", "high"), "gemini-pro-agent");
 	assert.equal(getAntigravityRequestModelId("claude-sonnet-4-6", "high"), "claude-sonnet-4-6");
+	// Gemini 4 family: Hydrogen is the only model with an -xhigh wire id.
+	assert.equal(getAntigravityRequestModelId("gemini-4-hydrogen", "xhigh"), "gemini-4-hydrogen-xhigh");
+	assert.equal(getAntigravityRequestModelId("gemini-4-hydrogen", "high"), "gemini-4-hydrogen-high");
+	assert.equal(getAntigravityRequestModelId("gemini-4-carbon", "xhigh"), "gemini-4-carbon-high");
+	assert.equal(getAntigravityRequestModelId("gemini-4-carbon", "medium"), "gemini-4-carbon-medium");
+	assert.equal(getAntigravityRequestModelId("gpt-oss-120b", "off"), "gpt-oss-120b-medium");
 	for (const [family, tier] of [
 		["opus", "low"],
 		["opus", "medium"],
@@ -397,6 +409,11 @@ test("Claude 5.5 tier requests keep their exact runtime model ids", () => {
 });
 
 test("fallback runtime model covers next-gen gemini only", () => {
+	assert.equal(getFallbackRuntimeModel("gemini-4-hydrogen-xhigh"), "gemini-4-carbon-high");
+	assert.equal(getFallbackRuntimeModel("gemini-4-hydrogen-high"), "gemini-4-carbon-high");
+	assert.equal(getFallbackRuntimeModel("gemini-4-hydrogen"), "gemini-4-carbon-low");
+	assert.equal(getFallbackRuntimeModel("gemini-4-carbon-high"), "gemini-4-argon-high");
+	assert.equal(getFallbackRuntimeModel("gemini-4-carbon"), "gemini-4-argon-low");
 	assert.equal(getFallbackRuntimeModel("gemini-4-argon-high"), "gemini-3.8-flash-high");
 	assert.equal(getFallbackRuntimeModel("gemini-4-argon"), "gemini-3.8-flash-low");
 	assert.equal(getFallbackRuntimeModel("gemini-3.8-flash-high"), "gemini-3.7-flash-high");
@@ -804,7 +821,21 @@ test("buildRequest sends plain schemas to Cloud Code Assist VALIDATED mode", () 
 	assert.equal(request.requestType, "agent");
 	assert.equal(request.request.sessionId, "sess-42");
 	assert.match(request.requestId, /^agent\//);
-	assert.deepEqual(request.request.systemInstruction.parts, [{ text: "You are pi." }]);
+	// Pi's prompt stays authoritative, but it travels as a leading user turn:
+	// Antigravity answers 429 RESOURCE_EXHAUSTED when a third-party agent prompt
+	// sits in systemInstruction. The genuine upstream prompt owns that slot.
+	const firstTurn = request.request.contents[0];
+	assert.equal(firstTurn?.role, "user");
+	assert.equal(firstTurn?.parts[0]?.text, "You are pi.");
+	assert.equal(firstTurn?.parts[1]?.text, "hello");
+	const systemParts = request.request.systemInstruction?.parts ?? [];
+	assert.equal(systemParts.length, 1);
+	const upstreamPrompt = systemParts[0]?.text ?? "";
+	assert.match(upstreamPrompt, /^<identity>\nYou are Antigravity,/);
+	assert.match(upstreamPrompt, /Conversation ID: sess-42/);
+	assert.match(upstreamPrompt, /Command Working Directory: /);
+	assert.doesNotMatch(upstreamPrompt, /<workspace>|<appDataDir>|<conversation-id>/);
+	assert.doesNotMatch(upstreamPrompt, /You are pi\./);
 	assert.equal(request.request.generationConfig?.thinkingConfig?.thinkingLevel, "HIGH");
 	assert.equal(request.request.generationConfig?.maxOutputTokens, 65536);
 	assert.equal(request.request.toolConfig?.functionCallingConfig.mode, "VALIDATED");
@@ -818,6 +849,101 @@ test("buildRequest sends plain schemas to Cloud Code Assist VALIDATED mode", () 
 	assert.deepEqual(schema.required, ["path"]);
 	assert.equal(schema.additionalProperties, undefined);
 	assert.deepEqual(schema.properties.offset, { type: "number" });
+
+	// The wire carries Pi's tools followed by the genuine Antigravity set.
+	const declarationNames = (request.request.tools?.[0]?.functionDeclarations ?? []).map(
+		(entry) => entry.name,
+	);
+	assert.equal(declarationNames[0], "read");
+	for (const name of ["read_file", "write_file", "edit_file", "run_command", "invoke_subagent"]) {
+		assert.ok(declarationNames.includes(name), `missing upstream tool ${name}`);
+	}
+	assert.equal(new Set(declarationNames).size, declarationNames.length);
+
+	// Upstream schemas are not passed through the Pi-tool cleanup: the genuine
+	// `$schema` marker stays on the Gemini `parametersJsonSchema` path.
+	const readFile = request.request.tools?.[0]?.functionDeclarations.find(
+		(entry) => entry.name === "read_file",
+	);
+	const readFileSchema = readFile?.parametersJsonSchema as { $schema?: string } | undefined;
+	assert.equal(readFileSchema?.$schema, "https://json-schema.org/draft/2020-12/schema");
+});
+
+test("buildRequest keeps the Pi prompt out of systemInstruction without an upstream prompt", () => {
+	const model = fakeModel("gemini-3.7-flash");
+	const previous = process.env.ANTIGRAVITY_UPSTREAM_CONTRACT;
+	process.env.ANTIGRAVITY_UPSTREAM_CONTRACT = "off";
+	try {
+		const off = buildRequest(
+			model,
+			normalizeContext({
+				systemPrompt: "You are pi.",
+				messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+			} as never),
+			"project-1",
+			{ sessionId: "sess-42" } as never,
+			"gemini-3.7-flash-high",
+		);
+		assert.equal(off.request.systemInstruction, undefined);
+		assert.equal(off.request.contents[0]?.parts[0]?.text, "You are pi.");
+		assert.equal(off.request.contents[0]?.parts[1]?.text, "hello");
+	} finally {
+		if (previous === undefined) delete process.env.ANTIGRAVITY_UPSTREAM_CONTRACT;
+		else process.env.ANTIGRAVITY_UPSTREAM_CONTRACT = previous;
+	}
+});
+
+test("buildRequest uses the upstream prompt alone without a Pi prompt and never duplicates it", () => {
+	const model = fakeModel("gemini-3.7-flash");
+	const bare = buildRequest(
+		model,
+		normalizeContext({
+			messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+		} as never),
+		"project-1",
+		{ sessionId: "sess-42" } as never,
+		"gemini-3.7-flash-high",
+	);
+	assert.equal(bare.request.systemInstruction?.parts.length, 1);
+	assert.match(
+		bare.request.systemInstruction?.parts[0]?.text ?? "",
+		/^<identity>\nYou are Antigravity,/,
+	);
+	assert.equal(bare.request.contents[0]?.parts[0]?.text, "hi");
+
+	const marker = "<identity>\nYou are Antigravity, a powerful agentic AI assistant";
+	const alreadyDumped = buildRequest(
+		model,
+		normalizeContext({
+			systemPrompt: marker,
+			messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+		} as never),
+		"project-1",
+		{ sessionId: "sess-42" } as never,
+		"gemini-3.7-flash-high",
+	);
+	assert.equal(alreadyDumped.request.systemInstruction, undefined);
+	assert.equal(alreadyDumped.request.contents[0]?.parts[0]?.text, marker);
+});
+
+test("convertUpstreamTools keeps genuine schemas for Gemini and reduces them for the legacy bridge", () => {
+	const gemini = convertUpstreamTools().find((declaration) => declaration.name === "read_file");
+	assert.ok(gemini && "parametersJsonSchema" in gemini);
+	assert.equal(
+		(gemini.parametersJsonSchema as { $schema?: string }).$schema,
+		"https://json-schema.org/draft/2020-12/schema",
+	);
+
+	const legacy = convertUpstreamTools(true).find((declaration) => declaration.name === "read_file");
+	assert.ok(legacy && "parameters" in legacy);
+	const legacySchema = legacy.parameters as {
+		type?: string;
+		properties?: Record<string, unknown>;
+		additionalProperties?: unknown;
+	};
+	assert.equal(legacySchema.type, "object");
+	assert.ok(legacySchema.properties?.Path);
+	assert.equal(legacySchema.additionalProperties, undefined);
 });
 
 test("friendly errors are actionable and redacted", () => {
@@ -1039,6 +1165,87 @@ test("plan-quota 429 fails fast without retries or endpoint hopping", async () =
 	);
 });
 
+test("transient 429 honors a short Retry-After and retries the same endpoint", async () => {
+	const sessionsFile = join(tmpdir(), `ag-retry-after-${Date.now()}.json`);
+	await withEnvAsync(
+		{ ANTIGRAVITY_SESSIONS_FILE: sessionsFile, ANTIGRAVITY_THROTTLE_BASE_DELAY_MS: "0" },
+		async () => {
+			await withFetchStub(
+				(_url, call) =>
+					call === 1
+						? new Response(JSON.stringify({ error: { code: 429, message: "RESOURCE_EXHAUSTED" } }), {
+								status: 429,
+								headers: { "content-type": "application/json", "retry-after": "0" },
+							})
+						: new Response(STREAM_OK_SSE, {
+								status: 200,
+								headers: { "content-type": "text/event-stream" },
+							}),
+				async (calls) => {
+					const message = await streamAntigravityOnce("-4545454545");
+					assert.equal(calls.length, 2);
+					assert.notEqual(message.stopReason, "error");
+				},
+			);
+		},
+	);
+});
+
+test("a long Retry-After cooldown burns no retry attempts", async () => {
+	const sessionsFile = join(tmpdir(), `ag-retry-after-long-${Date.now()}.json`);
+	await withEnvAsync(
+		{ ANTIGRAVITY_SESSIONS_FILE: sessionsFile, ANTIGRAVITY_THROTTLE_BASE_DELAY_MS: "0" },
+		async () => {
+			await withFetchStub(
+				() =>
+					new Response(JSON.stringify({ error: { code: 429, message: "RESOURCE_EXHAUSTED" } }), {
+						status: 429,
+						headers: { "content-type": "application/json", "retry-after": "3600" },
+					}),
+				async (calls) => {
+					const message = await streamAntigravityOnce("-4646464646");
+					assert.equal(calls.length, 1);
+					assert.equal(message.stopReason, "error");
+					assert.match(message.errorMessage ?? "", /Rate limited by Antigravity/);
+				},
+			);
+		},
+	);
+});
+
+test("parseRetryAfterSeconds accepts seconds and HTTP dates, refuses garbage", () => {
+	assert.equal(parseRetryAfterSeconds("120"), 120);
+	assert.equal(parseRetryAfterSeconds(" 0 "), 0);
+	assert.equal(parseRetryAfterSeconds(null), undefined);
+	assert.equal(parseRetryAfterSeconds(""), undefined);
+	assert.equal(parseRetryAfterSeconds("soon"), undefined);
+	const inAnHour = new Date(Date.now() + 3_600_000).toUTCString();
+	const parsed = parseRetryAfterSeconds(inAnHour);
+	assert.ok(parsed !== undefined && parsed > 3500 && parsed <= 3600);
+	assert.equal(parseRetryAfterSeconds(new Date(Date.now() - 60_000).toUTCString()), 0);
+});
+
+test("friendly 403 TOS_VIOLATION warns about account risk instead of re-login advice", () => {
+	const body = JSON.stringify({
+		error: {
+			code: 403,
+			message: "PERMISSION_DENIED",
+			status: "PERMISSION_DENIED",
+			details: [
+				{
+					"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+					reason: "TOS_VIOLATION",
+					metadata: { violation: "Using third party software, tools, or services to access Antigravity" },
+				},
+			],
+		},
+	});
+	const message = friendlyAntigravityError(403, body);
+	assert.match(message, /TOS_VIOLATION/);
+	assert.match(message, /suspended/);
+	assert.doesNotMatch(message, /re-login, or use an account with access/);
+});
+
 test("5xx still falls back to the next endpoint", async () => {
 	const sessionsFile = join(tmpdir(), `ag-endpoint-fallback-${Date.now()}.json`);
 	await withEnvAsync({ ANTIGRAVITY_SESSIONS_FILE: sessionsFile }, async () => {
@@ -1097,7 +1304,7 @@ test("retired Gemini 3.5 SSE notice fails without emitting it as assistant text"
 			for await (const event of stream) eventTypes.push(event.type);
 
 			assert.equal(result.stopReason, "error");
-			assert.match(result.errorMessage ?? "", /switch to gemini-3\.8-flash/i);
+			assert.match(result.errorMessage ?? "", /switch to a current catalog model/i);
 			assert.deepEqual(result.content, []);
 			assert.equal(eventTypes.some((type) => type.startsWith("text_")), false);
 		}
@@ -1136,7 +1343,7 @@ test("interleaved Gemini thinking does not leak a retired-model notice", async (
 			for await (const event of stream) eventTypes.push(event.type);
 
 			assert.equal(result.stopReason, "error");
-			assert.match(result.errorMessage ?? "", /switch to gemini-3\.8-flash/i);
+			assert.match(result.errorMessage ?? "", /switch to a current catalog model/i);
 			assert.deepEqual(result.content, []);
 			assert.equal(eventTypes.some((type) => type.startsWith("text_")), false);
 		},
@@ -1260,7 +1467,7 @@ test("retirement detection releases the reader when cancellation succeeds", asyn
 
 	await assert.rejects(
 		streamResponse(response, stream, output, undefined, undefined, true),
-		/Gemini 3\.5 Flash is no longer available/,
+		/retired and is no longer available/,
 	);
 	assert.equal(cancelCalled, true);
 	assert.equal(response.body?.locked, false);
@@ -1278,7 +1485,7 @@ test("retirement detection releases the reader when cancellation rejects", async
 
 	await assert.rejects(
 		streamResponse(response, stream, output, undefined, undefined, true),
-		/Gemini 3\.5 Flash is no longer available/,
+		/retired and is no longer available/,
 	);
 	assert.equal(cancelCalled, true);
 	assert.equal(response.body?.locked, false);
@@ -1361,6 +1568,62 @@ test("streamResponse parses SSE into blocks, usage, and stop reason", async () =
 	assert.equal(output.stopReason, "toolUse");
 });
 
+test("streamResponse bridges genuine Antigravity tool calls to Pi built-ins", async () => {
+	const sse = 'data: {"response":{"candidates":[{"content":{"parts":[{"functionCall":{"id":"read-1","name":"read_file","args":{"Path":"/tmp/a.ts","StartLine":3,"EndLine":5}}}]}}]}}\n\n';
+	const previous = process.env.ANTIGRAVITY_UPSTREAM_CONTRACT;
+	delete process.env.ANTIGRAVITY_UPSTREAM_CONTRACT;
+	try {
+		const stream = createAssistantMessageEventStream();
+		const output = {
+			role: "assistant" as const,
+			content: [] as unknown[],
+			api: ANTIGRAVITY_API,
+			provider: PROVIDER_ID,
+			model: "gemini-3.7-flash",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			stopReason: "stop" as const,
+			timestamp: Date.now(),
+		};
+		await streamResponse(new Response(sse), stream, output as never);
+		const call = (output.content as Array<{ type: string; name?: string; arguments?: unknown }>).find(
+			(block) => block.type === "toolCall",
+		);
+		assert.equal(call?.name, "read");
+		assert.deepEqual(call?.arguments, { path: "/tmp/a.ts", offset: 3, limit: 3 });
+	} finally {
+		if (previous === undefined) delete process.env.ANTIGRAVITY_UPSTREAM_CONTRACT;
+		else process.env.ANTIGRAVITY_UPSTREAM_CONTRACT = previous;
+	}
+});
+
+test("streamResponse keeps upstream names when the contract is disabled", async () => {
+	const sse = 'data: {"response":{"candidates":[{"content":{"parts":[{"functionCall":{"id":"read-1","name":"read_file","args":{"Path":"/tmp/a.ts"}}}]}}]}}\n\n';
+	const previous = process.env.ANTIGRAVITY_UPSTREAM_CONTRACT;
+	process.env.ANTIGRAVITY_UPSTREAM_CONTRACT = "off";
+	try {
+		const stream = createAssistantMessageEventStream();
+		const output = {
+			role: "assistant" as const,
+			content: [] as unknown[],
+			api: ANTIGRAVITY_API,
+			provider: PROVIDER_ID,
+			model: "gemini-3.7-flash",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			stopReason: "stop" as const,
+			timestamp: Date.now(),
+		};
+		await streamResponse(new Response(sse), stream, output as never);
+		const call = (output.content as Array<{ type: string; name?: string; arguments?: unknown }>).find(
+			(block) => block.type === "toolCall",
+		);
+		assert.equal(call?.name, "read_file");
+		assert.deepEqual(call?.arguments, { Path: "/tmp/a.ts" });
+	} finally {
+		if (previous === undefined) delete process.env.ANTIGRAVITY_UPSTREAM_CONTRACT;
+		else process.env.ANTIGRAVITY_UPSTREAM_CONTRACT = previous;
+	}
+});
+
 test("streamResponse updates sessionState.lastExecutionId from responseId", async () => {
 	const sse = 'data: {"response":{"responseId":"resp-session-999","candidates":[{"finishReason":"STOP"}]}}\n\n';
 	const body = new Response(sse);
@@ -1434,6 +1697,46 @@ test("antigravityHeaders carry bearer auth and client metadata", () => {
 	assert.equal(headers.Authorization, "Bearer tok");
 	assert.equal(headers.Accept, "text/event-stream");
 	assert.ok(headers["Client-Metadata"].includes("ANTIGRAVITY"));
+});
+
+test("antigravityHeaders identify as the pinned Antigravity Hub client", () => {
+	const userAgent = antigravityHeaders("tok")["User-Agent"];
+	assert.match(
+		userAgent,
+		/^antigravity\/hub\/\d+\.\d+\.\d+ \(aidev_client; os_type=[a-z0-9]+; arch=[a-z0-9]+; cl=\d+\)$/,
+	);
+	assert.ok(userAgent.includes(`antigravity/hub/${ANTIGRAVITY_UPSTREAM_HUB_VERSION} `));
+	assert.ok(userAgent.includes(`cl=${ANTIGRAVITY_UPSTREAM_HUB_CL})`));
+});
+
+test("antigravityHeaders generate a fresh trace and request id per call", () => {
+	const first = antigravityHeaders("tok");
+	const second = antigravityHeaders("tok");
+	assert.ok(first["x-cloudaicompanion-trace-id"]);
+	assert.ok(first["X-Aicode-Request-Id"]);
+	assert.notEqual(first["x-cloudaicompanion-trace-id"], second["x-cloudaicompanion-trace-id"]);
+	assert.notEqual(first["X-Aicode-Request-Id"], second["X-Aicode-Request-Id"]);
+});
+
+test("retirement detection covers the models removed 2026-11-18", async () => {
+	// Claude/GPT retirements reuse the plain-text notice shape observed for Gemini 3.5.
+	const body = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(
+				new TextEncoder().encode(
+					retirementSse([{ text: "claude-opus-4-6 is no longer available. Please switch to" }]),
+				),
+			);
+		},
+		cancel() {},
+	});
+	const output = streamResponseOutput();
+	const stream = createAssistantMessageEventStream();
+	await assert.rejects(
+		streamResponse(new Response(body), stream, output, undefined, undefined, true),
+		/retired and is no longer available/,
+	);
+	assert.deepEqual(output.content, []);
 });
 
 test("isUsableRuntimeModelId rejects placeholder enums", () => {

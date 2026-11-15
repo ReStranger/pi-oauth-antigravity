@@ -134,7 +134,13 @@ export type GeminiGenerationConfig = {
 
 export type GeminiRequestBody = {
   contents: GeminiContent[];
-  systemInstruction: {
+  /**
+   * Omitted when the caller has its own prompt and the backend rejects it in the
+   * system slot: Antigravity answers 429 RESOURCE_EXHAUSTED for systemInstruction
+   * payloads that fingerprint a third-party coding agent, but accepts the same
+   * text as a leading user turn.
+   */
+  systemInstruction?: {
     role: GeminiRole.User;
     parts: GeminiTextPart[];
   };

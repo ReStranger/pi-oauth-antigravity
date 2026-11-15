@@ -14,6 +14,10 @@ import { assertSafeApiBaseUrl, safeError } from "../utils/security.js";
 import type { AntigravityApiKey, DynamicModelInfo } from "../types/types.js";
 import { antigravityEnv, asString, escapeRegExp, isRecord } from "../utils/util.js";
 import { antigravityFetch } from "../utils/http.js";
+import {
+  ANTIGRAVITY_UPSTREAM_HUB_CL,
+  ANTIGRAVITY_UPSTREAM_HUB_VERSION,
+} from "../antigravity-upstream.js";
 
 export const DEFAULT_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
 export const ENDPOINT_FALLBACKS = [
@@ -67,15 +71,14 @@ export function endpointCandidates(preferredEndpoint?: string): string[] {
 // Cloud Code rejects newer models (e.g. Gemini 4 Argon) for clients below 2.23.0, and a
 // stale identity silently gets a REDUCED catalog from discovery (no error): control-plane
 // requests sent as antigravity/1.11.3 returned fewer models (codex2api e3d59f9). Track the
-// shipping client — oh-my-pi pinned 2.32.1 on 2026-11-14 for the same reason.
-const DEFAULT_ANTIGRAVITY_VERSION = "2.32.1";
-const DEFAULT_ANTIGRAVITY_CL = "963137146";
-
+// shipping Hub client — the version and Piper changelist are generated from the official
+// Hub updater manifest, so they follow Hub releases without manual bumps.
 function defaultUserAgent(): string {
-  const version = antigravityEnv("HUB_VERSION") || DEFAULT_ANTIGRAVITY_VERSION;
-  const cl = antigravityEnv("HUB_CL") || DEFAULT_ANTIGRAVITY_CL;
-  const os = antigravityEnv("HUB_OS") || "darwin";
-  const arch = antigravityEnv("HUB_ARCH") || "arm64";
+  const version = antigravityEnv("HUB_VERSION") || ANTIGRAVITY_UPSTREAM_HUB_VERSION;
+  const cl = antigravityEnv("HUB_CL") || ANTIGRAVITY_UPSTREAM_HUB_CL;
+  const os =
+    antigravityEnv("HUB_OS") || (process.platform === "win32" ? "windows" : process.platform);
+  const arch = antigravityEnv("HUB_ARCH") || process.arch;
   return `antigravity/hub/${version} (aidev_client; os_type=${os}; arch=${arch}; cl=${cl})`;
 }
 
